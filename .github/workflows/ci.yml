@@ -58,7 +58,7 @@ jobs:
           cache: maven
 
       - name: Run integration tests
-        run: mvn -B verify -DskipTests
+        run: mvn -B verify -Pintegration-tests -DskipTests
 
       - name: Upload integration test results
         uses: actions/upload-artifact@v4
