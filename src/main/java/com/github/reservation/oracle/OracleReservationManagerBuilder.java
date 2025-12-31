@@ -8,6 +8,8 @@ import java.util.Objects;
 
 /**
  * Builder for creating Oracle/JDBC-backed {@link ReservationManager} instances.
+ *
+ * <p>Each ReservationManager manages a single domain.</p>
  */
 public final class OracleReservationManagerBuilder
         extends AbstractReservationManagerBuilder<OracleReservationManagerBuilder> {
@@ -52,6 +54,7 @@ public final class OracleReservationManagerBuilder
 
     @Override
     public ReservationManager build() {
+        validate();
         LockingStrategy strategy = lockingStrategy != null
             ? lockingStrategy
             : new TableBasedLockingStrategy(dataSource, tableName);
@@ -59,8 +62,8 @@ public final class OracleReservationManagerBuilder
         return new OracleReservationManager(
             dataSource,
             strategy,
+            domain,
             leaseTime,
-            delimiter,
             tableName,
             meterRegistry
         );

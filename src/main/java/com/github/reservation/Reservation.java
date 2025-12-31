@@ -8,8 +8,8 @@ import java.util.concurrent.locks.Lock;
 /**
  * A distributed reservation (soft-lock) that automatically expires after a configured lease time.
  *
- * <p>This reservation is identified by a domain and identifier combination, allowing
- * logical grouping of locks (e.g., domain="orders", identifier="12345").</p>
+ * <p>This reservation is identified by an identifier within a domain. The domain is configured
+ * on the {@link ReservationManager} that created this reservation.</p>
  *
  * <p><b>Important:</b> The {@link #newCondition()} method is not supported for
  * distributed locks and will throw {@link UnsupportedOperationException}.</p>
@@ -21,13 +21,6 @@ import java.util.concurrent.locks.Lock;
 public interface Reservation extends Lock {
 
     /**
-     * Returns the domain of this reservation.
-     *
-     * @return the domain string, never null
-     */
-    String getDomain();
-
-    /**
      * Returns the identifier of this reservation within its domain.
      *
      * @return the identifier string, never null
@@ -36,7 +29,6 @@ public interface Reservation extends Lock {
 
     /**
      * Returns the composite key used for this reservation.
-     * Format: "{domain}{delimiter}{identifier}"
      *
      * @return the composite key string, never null
      */
@@ -56,13 +48,6 @@ public interface Reservation extends Lock {
      * @return true if the reservation is held, false otherwise
      */
     boolean isLocked();
-
-    /**
-     * Checks if this reservation is held by the current thread.
-     *
-     * @return true if current thread holds the reservation, false otherwise
-     */
-    boolean isHeldByCurrentThread();
 
     /**
      * Forces the release of this reservation regardless of ownership.

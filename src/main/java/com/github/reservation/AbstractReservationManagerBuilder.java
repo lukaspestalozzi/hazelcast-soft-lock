@@ -12,9 +12,30 @@ import java.util.Objects;
  */
 public abstract class AbstractReservationManagerBuilder<T extends AbstractReservationManagerBuilder<T>> {
 
+    protected String domain;
     protected Duration leaseTime = Duration.ofMinutes(1);
-    protected String delimiter = "::";
     protected MeterRegistry meterRegistry = null;
+
+    /**
+     * Sets the domain for this ReservationManager. This is required.
+     *
+     * <p>Each ReservationManager manages reservations for a single domain.
+     * For Hazelcast, each domain uses a separate IMap for isolation.</p>
+     *
+     * @param domain the domain name (e.g., "orders", "users", "inventory")
+     * @return this builder
+     * @throws NullPointerException if domain is null
+     * @throws IllegalArgumentException if domain is empty
+     */
+    @SuppressWarnings("unchecked")
+    public T domain(String domain) {
+        Objects.requireNonNull(domain, "domain must not be null");
+        if (domain.isEmpty()) {
+            throw new IllegalArgumentException("domain must not be empty");
+        }
+        this.domain = domain;
+        return (T) this;
+    }
 
     /**
      * Sets the lease time for reservations. Default: 1 minute.
@@ -34,22 +55,6 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
     }
 
     /**
-     * Sets the delimiter for composite keys. Default: "::"
-     *
-     * @param delimiter the delimiter string (must not be null or empty)
-     * @return this builder
-     */
-    @SuppressWarnings("unchecked")
-    public T delimiter(String delimiter) {
-        Objects.requireNonNull(delimiter, "delimiter must not be null");
-        if (delimiter.isEmpty()) {
-            throw new IllegalArgumentException("delimiter must not be empty");
-        }
-        this.delimiter = delimiter;
-        return (T) this;
-    }
-
-    /**
      * Sets the Micrometer registry for metrics. Default: none (metrics disabled)
      *
      * @param meterRegistry the meter registry, or null to disable metrics
@@ -62,9 +67,21 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
     }
 
     /**
+     * Validates that all required fields are set.
+     *
+     * @throws IllegalStateException if required fields are missing
+     */
+    protected void validate() {
+        if (domain == null) {
+            throw new IllegalStateException("domain must be set before building");
+        }
+    }
+
+    /**
      * Builds the ReservationManager with the configured settings.
      *
      * @return a new ReservationManager instance
+     * @throws IllegalStateException if required configuration is missing
      */
     public abstract ReservationManager build();
 }

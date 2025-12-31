@@ -8,12 +8,15 @@ import java.util.Objects;
 
 /**
  * Builder for creating Hazelcast-backed {@link ReservationManager} instances.
+ *
+ * <p>Each ReservationManager manages a single domain, and uses a dedicated
+ * Hazelcast IMap for that domain (named "reservations-{domain}").</p>
  */
 public final class HazelcastReservationManagerBuilder
         extends AbstractReservationManagerBuilder<HazelcastReservationManagerBuilder> {
 
     private final HazelcastInstance hazelcastInstance;
-    private String mapName = "reservations";
+    private String mapPrefix = "reservations";
 
     public HazelcastReservationManagerBuilder(HazelcastInstance hazelcastInstance) {
         this.hazelcastInstance = Objects.requireNonNull(hazelcastInstance,
@@ -21,26 +24,30 @@ public final class HazelcastReservationManagerBuilder
     }
 
     /**
-     * Sets the Hazelcast IMap name for storing reservations. Default: "reservations"
+     * Sets the prefix for the Hazelcast IMap name. Default: "reservations"
      *
-     * @param mapName the map name (must not be null or empty)
+     * <p>The actual map name will be "{prefix}-{domain}".</p>
+     *
+     * @param mapPrefix the map name prefix (must not be null or empty)
      * @return this builder
      */
-    public HazelcastReservationManagerBuilder mapName(String mapName) {
-        Objects.requireNonNull(mapName, "mapName must not be null");
-        if (mapName.isEmpty()) {
-            throw new IllegalArgumentException("mapName must not be empty");
+    public HazelcastReservationManagerBuilder mapPrefix(String mapPrefix) {
+        Objects.requireNonNull(mapPrefix, "mapPrefix must not be null");
+        if (mapPrefix.isEmpty()) {
+            throw new IllegalArgumentException("mapPrefix must not be empty");
         }
-        this.mapName = mapName;
+        this.mapPrefix = mapPrefix;
         return this;
     }
 
     @Override
     public ReservationManager build() {
+        validate();
+        String mapName = mapPrefix + "-" + domain;
         return new HazelcastReservationManager(
             hazelcastInstance,
+            domain,
             leaseTime,
-            delimiter,
             mapName,
             meterRegistry
         );

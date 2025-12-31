@@ -52,11 +52,6 @@ final class OracleReservation implements Reservation {
     }
 
     @Override
-    public String getDomain() {
-        return domain;
-    }
-
-    @Override
     public String getIdentifier() {
         return identifier;
     }
@@ -87,8 +82,10 @@ final class OracleReservation implements Reservation {
         }
     }
 
-    @Override
-    public boolean isHeldByCurrentThread() {
+    /**
+     * Internal check for reentrancy - checks if current thread holds this lock.
+     */
+    private boolean heldByCurrentThread() {
         String holder = currentHolder.get();
         if (holder == null) {
             return false;
@@ -119,7 +116,7 @@ final class OracleReservation implements Reservation {
     @Override
     public void lock() {
         // Check for reentrancy
-        if (isHeldByCurrentThread()) {
+        if (heldByCurrentThread()) {
             lockCount.set(lockCount.get() + 1);
             log.debug("Reentrant lock acquired: {} (count={})", reservationKey, lockCount.get());
             return;
@@ -176,7 +173,7 @@ final class OracleReservation implements Reservation {
         }
 
         // Check for reentrancy
-        if (isHeldByCurrentThread()) {
+        if (heldByCurrentThread()) {
             lockCount.set(lockCount.get() + 1);
             log.debug("Reentrant lock acquired (interruptibly): {} (count={})", reservationKey, lockCount.get());
             return;
@@ -229,7 +226,7 @@ final class OracleReservation implements Reservation {
     @Override
     public boolean tryLock() {
         // Check for reentrancy
-        if (isHeldByCurrentThread()) {
+        if (heldByCurrentThread()) {
             lockCount.set(lockCount.get() + 1);
             log.debug("Reentrant tryLock acquired: {} (count={})", reservationKey, lockCount.get());
             return true;
@@ -274,7 +271,7 @@ final class OracleReservation implements Reservation {
         }
 
         // Check for reentrancy
-        if (isHeldByCurrentThread()) {
+        if (heldByCurrentThread()) {
             lockCount.set(lockCount.get() + 1);
             log.debug("Reentrant tryLock (timed) acquired: {} (count={})", reservationKey, lockCount.get());
             return true;

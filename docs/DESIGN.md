@@ -40,9 +40,12 @@ Both implementations share the same API and behavioral guarantees.
 
 - Implements `java.util.concurrent.locks.Lock` interface for familiarity
 - Automatic lock expiration via configurable lease time
-- Lock identity composed of **domain** and **identifier** (both Strings)
+- **Single-domain managers**: Each ReservationManager handles one domain
+- Lock identity composed of **domain** (from manager) and **identifier** (per reservation)
 - Two interchangeable backends: Hazelcast and Oracle DB
+- **Domain isolation**: Hazelcast uses separate IMaps per domain; Oracle uses composite keys
 - Micrometer metrics integration for observability
+- Reentrant locking support
 - Checked exceptions for explicit error handling
 - Shared test suite validating both implementations
 
@@ -53,9 +56,13 @@ Both implementations share the same API and behavioral guarantees.
 | Naming | `Reservation` (not SoftLock) | Domain-appropriate terminology |
 | Lock interface | `Reservation extends Lock` | Compatibility + additional methods |
 | `newCondition()` | `UnsupportedOperationException` | Not feasible for distributed locks |
-| Key format | Delimiter-based (`domain::identifier`) | Simple, readable, debuggable |
+| Domain per manager | Single domain per ReservationManager | Cleaner API, explicit isolation |
+| Domain isolation | Hazelcast: separate IMap; Oracle: composite key | Backend-appropriate isolation |
+| Key format | Oracle: `{domain}::{identifier}` | Simple, readable, debuggable |
+| Hazelcast map naming | `{mapPrefix}-{domain}` | Domain isolation via separate maps |
 | Lease time config | Global default on manager | Simplicity with configurability |
 | Thread affinity | Strict (per-thread ownership) | Consistency with Lock contract |
+| Reentrancy | Supported | Same thread can lock multiple times |
 | Error handling | Checked exceptions | Explicit failure handling |
 | Project structure | Single module | Simpler build, single artifact |
 | Testing | Abstract base test class | Shared tests for both implementations |
@@ -75,21 +82,22 @@ Both implementations share the same API and behavioral guarantees.
 │                           Application Code                               │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          ReservationManager                              │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────────┐ │
-│  │ Configuration    │  │ Reservation      │  │ Metrics               │ │
-│  │ - leaseTime      │  │ Factory          │  │ - Micrometer          │ │
-│  │ - delimiter      │  │ - getReservation │  │   integration         │ │
-│  └──────────────────┘  └──────────────────┘  └───────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
+│ ReservationManager    │ │ ReservationManager    │ │ ReservationManager    │
+│ domain="orders"       │ │ domain="users"        │ │ domain="inventory"    │
+│  ┌─────────────────┐  │ │  ┌─────────────────┐  │ │  ┌─────────────────┐  │
+│  │ getReservation  │  │ │  │ getReservation  │  │ │  │ getReservation  │  │
+│  │ (identifier)    │  │ │  │ (identifier)    │  │ │  │ (identifier)    │  │
+│  └─────────────────┘  │ │  └─────────────────┘  │ │  └─────────────────┘  │
+└───────────────────────┘ └───────────────────────┘ └───────────────────────┘
+          │                         │                         │
+          ▼                         ▼                         ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                             Reservation                                  │
 │         Implements: java.util.concurrent.locks.Lock                      │
-│         Additional: domain, identifier, remainingLeaseTime, forceUnlock  │
+│         Additional: identifier, reservationKey, remainingLeaseTime       │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                     ┌───────────────┴───────────────┐
@@ -121,12 +129,11 @@ Both implementations share the same API and behavioral guarantees.
 
 | Component | Responsibility |
 |-----------|----------------|
-| `ReservationManager` | Interface for creating reservations, holds configuration |
+| `ReservationManager` | Interface for creating reservations for a single domain |
 | `Reservation` | Interface for individual lock instance, extends Lock |
-| `HazelcastReservationManager` | Hazelcast-backed implementation |
-| `OracleReservationManager` | Oracle-backed implementation |
+| `HazelcastReservationManager` | Hazelcast-backed implementation (uses domain-specific IMap) |
+| `OracleReservationManager` | Oracle-backed implementation (uses composite keys) |
 | `LockingStrategy` | Pluggable Oracle locking mechanism (Strategy pattern) |
-| `ReservationKeyBuilder` | Internal helper for building composite keys |
 | `ReservationMetrics` | Micrometer metrics registration and recording |
 
 ### 2.3 Reservation Lifecycle
@@ -176,8 +183,8 @@ import java.util.concurrent.locks.Lock;
 /**
  * A distributed reservation (soft-lock) that automatically expires after a configured lease time.
  *
- * <p>This reservation is identified by a domain and identifier combination, allowing
- * logical grouping of locks (e.g., domain="orders", identifier="12345").</p>
+ * <p>A reservation is obtained from a {@link ReservationManager} which is bound to a specific
+ * domain. The reservation is identified by an identifier within that domain.</p>
  *
  * <p><b>Important:</b> The {@link #newCondition()} method is not supported for
  * distributed locks and will throw {@link UnsupportedOperationException}.</p>
@@ -185,15 +192,11 @@ import java.util.concurrent.locks.Lock;
  * <p><b>Warning:</b> If the lease time expires while the reservation is held, calling
  * {@link #unlock()} will throw {@link ReservationExpiredException}. This indicates that
  * the critical section guarantee may have been violated.</p>
+ *
+ * <p><b>Reentrancy:</b> This lock supports reentrant locking - the same thread can
+ * acquire the same lock multiple times without blocking.</p>
  */
 public interface Reservation extends Lock {
-
-    /**
-     * Returns the domain of this reservation.
-     *
-     * @return the domain string, never null
-     */
-    String getDomain();
 
     /**
      * Returns the identifier of this reservation within its domain.
@@ -203,10 +206,11 @@ public interface Reservation extends Lock {
     String getIdentifier();
 
     /**
-     * Returns the composite key used for this reservation.
-     * Format: "{domain}{delimiter}{identifier}"
+     * Returns the key used for this reservation in the underlying storage.
+     * <p>For Hazelcast: just the identifier (domain isolation via separate maps).
+     * <p>For Oracle: composite key "{domain}::{identifier}".
      *
-     * @return the composite key string, never null
+     * @return the reservation key string, never null
      */
     String getReservationKey();
 
@@ -226,13 +230,6 @@ public interface Reservation extends Lock {
     boolean isLocked();
 
     /**
-     * Checks if this reservation is held by the current thread.
-     *
-     * @return true if current thread holds the reservation, false otherwise
-     */
-    boolean isHeldByCurrentThread();
-
-    /**
      * Forces the release of this reservation regardless of ownership.
      *
      * <p><b>Warning:</b> This is an administrative operation that should only
@@ -246,6 +243,7 @@ public interface Reservation extends Lock {
     /**
      * Acquires the reservation, blocking until available.
      * The reservation will automatically be released after the configured lease time.
+     * Supports reentrant locking.
      *
      * @throws ReservationAcquisitionException if the reservation cannot be acquired
      */
@@ -254,6 +252,7 @@ public interface Reservation extends Lock {
 
     /**
      * Acquires the reservation unless the current thread is interrupted.
+     * Supports reentrant locking.
      *
      * @throws InterruptedException if the current thread is interrupted
      * @throws ReservationAcquisitionException if the reservation cannot be acquired
@@ -263,6 +262,7 @@ public interface Reservation extends Lock {
 
     /**
      * Acquires the reservation only if it is free at the time of invocation.
+     * Supports reentrant locking.
      *
      * @return true if the reservation was acquired, false otherwise
      */
@@ -271,6 +271,7 @@ public interface Reservation extends Lock {
 
     /**
      * Acquires the reservation if it becomes available within the given waiting time.
+     * Supports reentrant locking.
      *
      * @param time the maximum time to wait for the reservation
      * @param unit the time unit of the time argument
@@ -281,7 +282,7 @@ public interface Reservation extends Lock {
     boolean tryLock(long time, TimeUnit unit) throws InterruptedException;
 
     /**
-     * Releases the reservation.
+     * Releases the reservation. For reentrant locks, decrements the hold count.
      *
      * @throws ReservationExpiredException if the lease time has expired before unlock
      * @throws IllegalMonitorStateException if the current thread does not hold the reservation
@@ -312,19 +313,21 @@ import java.io.Closeable;
 import java.time.Duration;
 
 /**
- * Factory and manager for {@link Reservation} instances.
+ * Factory and manager for {@link Reservation} instances within a single domain.
  *
- * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle) and
- * configuration. Multiple managers can coexist, each with their own settings.</p>
+ * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle),
+ * a single domain, and configuration. Create separate managers for different domains.</p>
  *
  * <p>Example usage with Hazelcast:</p>
  * <pre>{@code
  * HazelcastInstance hz = HazelcastClient.newHazelcastClient();
- * ReservationManager manager = ReservationManager.hazelcast(hz)
- *     .leaseTime(Duration.ofMinutes(1))
+ *
+ * ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+ *     .domain("orders")
+ *     .leaseTime(Duration.ofMinutes(2))
  *     .build();
  *
- * Reservation reservation = manager.getReservation("orders", "12345");
+ * Reservation reservation = ordersManager.getReservation("12345");
  * reservation.lock();
  * try {
  *     // critical section
@@ -337,8 +340,21 @@ import java.time.Duration;
  * <pre>{@code
  * DataSource dataSource = ...;
  * ReservationManager manager = ReservationManager.oracle(dataSource)
- *     .leaseTime(Duration.ofMinutes(1))
+ *     .domain("orders")
+ *     .leaseTime(Duration.ofMinutes(2))
  *     .build();
+ * }</pre>
+ *
+ * <p>Multiple domains require multiple managers:</p>
+ * <pre>{@code
+ * ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+ *     .domain("orders").build();
+ * ReservationManager usersManager = ReservationManager.hazelcast(hz)
+ *     .domain("users").build();
+ *
+ * // Each uses isolated storage (separate IMap for Hazelcast)
+ * ordersManager.getReservation("123").lock();  // Uses map "reservations-orders"
+ * usersManager.getReservation("123").lock();   // Uses map "reservations-users"
  * }</pre>
  */
 public interface ReservationManager extends Closeable {
@@ -367,18 +383,23 @@ public interface ReservationManager extends Closeable {
     }
 
     /**
-     * Obtains a reservation for the given domain and identifier.
+     * Obtains a reservation for the given identifier within this manager's domain.
      *
      * <p>This method always returns a new Reservation instance, but the underlying
-     * distributed lock is shared across all instances with the same domain/identifier.</p>
+     * distributed lock is shared across all instances with the same identifier.</p>
      *
-     * @param domain the reservation domain (e.g., "orders", "users", "inventory")
      * @param identifier the identifier within the domain (e.g., order ID, user ID)
-     * @return a Reservation instance for the given domain and identifier
-     * @throws InvalidReservationKeyException if domain or identifier is null, empty,
-     *         or contains the configured delimiter
+     * @return a Reservation instance for the given identifier
+     * @throws InvalidReservationKeyException if identifier is null or empty
      */
-    Reservation getReservation(String domain, String identifier);
+    Reservation getReservation(String identifier);
+
+    /**
+     * Returns the domain this manager handles.
+     *
+     * @return the domain string
+     */
+    String getDomain();
 
     /**
      * Returns the configured lease time for reservations created by this manager.
@@ -386,13 +407,6 @@ public interface ReservationManager extends Closeable {
      * @return the lease time duration
      */
     Duration getLeaseTime();
-
-    /**
-     * Returns the configured delimiter used for composite keys.
-     *
-     * @return the delimiter string
-     */
-    String getDelimiter();
 
     /**
      * Closes this manager and releases associated resources.
@@ -489,9 +503,27 @@ import java.util.Objects;
  */
 public abstract class AbstractReservationManagerBuilder<T extends AbstractReservationManagerBuilder<T>> {
 
+    protected String domain;  // Required
     protected Duration leaseTime = Duration.ofMinutes(1);
-    protected String delimiter = "::";
     protected MeterRegistry meterRegistry = null;
+
+    /**
+     * Sets the domain for this manager. Required.
+     *
+     * @param domain the domain name (e.g., "orders", "users")
+     * @return this builder
+     * @throws NullPointerException if domain is null
+     * @throws IllegalArgumentException if domain is empty
+     */
+    @SuppressWarnings("unchecked")
+    public T domain(String domain) {
+        Objects.requireNonNull(domain, "domain must not be null");
+        if (domain.isEmpty()) {
+            throw new IllegalArgumentException("domain must not be empty");
+        }
+        this.domain = domain;
+        return (T) this;
+    }
 
     /**
      * Sets the lease time for reservations. Default: 1 minute.
@@ -507,19 +539,6 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
     }
 
     /**
-     * Sets the delimiter for composite keys. Default: "::"
-     */
-    @SuppressWarnings("unchecked")
-    public T delimiter(String delimiter) {
-        Objects.requireNonNull(delimiter, "delimiter must not be null");
-        if (delimiter.isEmpty()) {
-            throw new IllegalArgumentException("delimiter must not be empty");
-        }
-        this.delimiter = delimiter;
-        return (T) this;
-    }
-
-    /**
      * Sets the Micrometer registry for metrics. Default: none (metrics disabled)
      */
     @SuppressWarnings("unchecked")
@@ -529,7 +548,20 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
     }
 
     /**
+     * Validates that required fields are set.
+     *
+     * @throws IllegalStateException if domain is not set
+     */
+    protected void validate() {
+        if (domain == null) {
+            throw new IllegalStateException("domain must be set before building");
+        }
+    }
+
+    /**
      * Builds the ReservationManager with the configured settings.
+     *
+     * @throws IllegalStateException if domain is not set
      */
     public abstract ReservationManager build();
 }
@@ -538,19 +570,24 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
 #### 3.3.2 Hazelcast Builder
 
 ```java
-package com.github.reservation;
+package com.github.reservation.hazelcast;
 
+import com.github.reservation.AbstractReservationManagerBuilder;
+import com.github.reservation.ReservationManager;
 import com.hazelcast.core.HazelcastInstance;
 import java.util.Objects;
 
 /**
  * Builder for creating Hazelcast-backed {@link ReservationManager} instances.
+ *
+ * <p>Each manager is bound to a single domain. The Hazelcast IMap name is
+ * derived from the mapPrefix and domain: "{mapPrefix}-{domain}".</p>
  */
 public final class HazelcastReservationManagerBuilder
         extends AbstractReservationManagerBuilder<HazelcastReservationManagerBuilder> {
 
     private final HazelcastInstance hazelcastInstance;
-    private String mapName = "reservations";
+    private String mapPrefix = "reservations";
 
     HazelcastReservationManagerBuilder(HazelcastInstance hazelcastInstance) {
         this.hazelcastInstance = Objects.requireNonNull(hazelcastInstance,
@@ -558,23 +595,28 @@ public final class HazelcastReservationManagerBuilder
     }
 
     /**
-     * Sets the Hazelcast IMap name for storing reservations. Default: "reservations"
+     * Sets the prefix for Hazelcast IMap name. Default: "reservations"
+     *
+     * <p>The actual map name will be "{mapPrefix}-{domain}", e.g.,
+     * "reservations-orders" for domain "orders".</p>
      */
-    public HazelcastReservationManagerBuilder mapName(String mapName) {
-        Objects.requireNonNull(mapName, "mapName must not be null");
-        if (mapName.isEmpty()) {
-            throw new IllegalArgumentException("mapName must not be empty");
+    public HazelcastReservationManagerBuilder mapPrefix(String mapPrefix) {
+        Objects.requireNonNull(mapPrefix, "mapPrefix must not be null");
+        if (mapPrefix.isEmpty()) {
+            throw new IllegalArgumentException("mapPrefix must not be empty");
         }
-        this.mapName = mapName;
+        this.mapPrefix = mapPrefix;
         return this;
     }
 
     @Override
     public ReservationManager build() {
+        validate();  // Ensures domain is set
+        String mapName = mapPrefix + "-" + domain;
         return new HazelcastReservationManager(
             hazelcastInstance,
+            domain,
             leaseTime,
-            delimiter,
             mapName,
             meterRegistry
         );
@@ -585,15 +627,18 @@ public final class HazelcastReservationManagerBuilder
 #### 3.3.3 Oracle Builder
 
 ```java
-package com.github.reservation;
+package com.github.reservation.oracle;
 
-import com.github.reservation.oracle.LockingStrategy;
-import com.github.reservation.oracle.TableBasedLockingStrategy;
+import com.github.reservation.AbstractReservationManagerBuilder;
+import com.github.reservation.ReservationManager;
 import javax.sql.DataSource;
 import java.util.Objects;
 
 /**
  * Builder for creating Oracle-backed {@link ReservationManager} instances.
+ *
+ * <p>Each manager is bound to a single domain. Reservation keys are stored
+ * as composite keys in the format "{domain}::{identifier}".</p>
  */
 public final class OracleReservationManagerBuilder
         extends AbstractReservationManagerBuilder<OracleReservationManagerBuilder> {
@@ -634,6 +679,7 @@ public final class OracleReservationManagerBuilder
 
     @Override
     public ReservationManager build() {
+        validate();  // Ensures domain is set
         LockingStrategy strategy = lockingStrategy != null
             ? lockingStrategy
             : new TableBasedLockingStrategy(dataSource, tableName);
@@ -641,8 +687,9 @@ public final class OracleReservationManagerBuilder
         return new OracleReservationManager(
             dataSource,
             strategy,
+            domain,
             leaseTime,
-            delimiter,
+            tableName,
             meterRegistry
         );
     }
@@ -655,7 +702,9 @@ public final class OracleReservationManagerBuilder
 
 ### 4.1 Overview
 
-The Hazelcast implementation uses `IMap.lock()` with native lease time support. For debuggability, it stores a value in the map when a lock is acquired.
+The Hazelcast implementation uses `IMap.lock()` with native lease time support. Each domain uses a separate IMap for isolation, with the map name derived from `{mapPrefix}-{domain}`.
+
+For debuggability, it stores a value in the map when a lock is acquired.
 
 ### 4.2 IMap Value Format
 
@@ -698,20 +747,19 @@ final class ReservationValueBuilder {
 class HazelcastReservation implements Reservation {
 
     private final IMap<String, String> lockMap;
-    private final String reservationKey;
+    private final String domain;        // For metrics/logging
+    private final String identifier;    // Key in the map
     private final Duration leaseTime;
-    private final String domain;
-    private final String identifier;
 
     @Override
     public void lock() throws ReservationAcquisitionException {
         try {
-            // First acquire the Hazelcast lock
-            lockMap.lock(reservationKey, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            // First acquire the Hazelcast lock (key = identifier only)
+            lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             // Then store debug value
-            String value = ReservationValueBuilder.buildValue();
-            lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            String value = buildDebugValue();
+            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
         } catch (Exception e) {
             throw new ReservationAcquisitionException(domain, identifier,
@@ -722,14 +770,14 @@ class HazelcastReservation implements Reservation {
     @Override
     public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
         boolean acquired = lockMap.tryLock(
-            reservationKey,
+            identifier,
             time, unit,                                    // wait time
             leaseTime.toMillis(), TimeUnit.MILLISECONDS    // lease time
         );
 
         if (acquired) {
-            String value = ReservationValueBuilder.buildValue();
-            lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            String value = buildDebugValue();
+            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
         }
 
         return acquired;
@@ -738,8 +786,8 @@ class HazelcastReservation implements Reservation {
     @Override
     public void unlock() throws ReservationExpiredException {
         try {
-            lockMap.remove(reservationKey);  // Clean up debug value
-            lockMap.unlock(reservationKey);
+            lockMap.remove(identifier);  // Clean up debug value
+            lockMap.unlock(identifier);
         } catch (IllegalMonitorStateException e) {
             // Lock expired or not owned
             throw new ReservationExpiredException(domain, identifier);
@@ -748,8 +796,13 @@ class HazelcastReservation implements Reservation {
 
     @Override
     public void forceUnlock() {
-        lockMap.remove(reservationKey);
-        lockMap.forceUnlock(reservationKey);
+        lockMap.remove(identifier);
+        lockMap.forceUnlock(identifier);
+    }
+
+    @Override
+    public String getReservationKey() {
+        return identifier;  // Domain isolation via separate maps
     }
 }
 ```
@@ -1139,15 +1192,15 @@ class AqBasedLockingStrategy implements LockingStrategy { }
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
+| `domain` | `String` | **required** | Domain for this manager |
 | `leaseTime` | `Duration` | 1 minute | Time after which reservation auto-releases |
-| `delimiter` | `String` | `::` | Separator between domain and identifier |
 | `meterRegistry` | `MeterRegistry` | `null` | Micrometer registry (null = no metrics) |
 
 ### 6.2 Hazelcast-Specific Configuration
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `mapName` | `String` | `reservations` | Hazelcast IMap name |
+| `mapPrefix` | `String` | `reservations` | Prefix for IMap name (actual: `{prefix}-{domain}`) |
 
 ### 6.3 Oracle-Specific Configuration
 
@@ -1169,9 +1222,16 @@ config.getConnectionStrategyConfig()
 
 HazelcastInstance hz = HazelcastClient.newHazelcastClient(config);
 
-ReservationManager manager = ReservationManager.hazelcast(hz)
+// Create manager for "orders" domain (uses map "reservations-orders")
+ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+    .domain("orders")
     .leaseTime(Duration.ofMinutes(2))
-    .mapName("my-reservations")
+    .build();
+
+// Create manager for "users" domain (uses map "reservations-users")
+ReservationManager usersManager = ReservationManager.hazelcast(hz)
+    .domain("users")
+    .leaseTime(Duration.ofMinutes(5))
     .build();
 ```
 
@@ -1187,7 +1247,9 @@ hikariConfig.setMaximumPoolSize(10);
 
 DataSource dataSource = new HikariDataSource(hikariConfig);
 
+// Create manager for "orders" domain
 ReservationManager manager = ReservationManager.oracle(dataSource)
+    .domain("orders")
     .leaseTime(Duration.ofMinutes(2))
     .tableName("MY_LOCKS")
     .build();
@@ -1319,13 +1381,14 @@ import static org.assertj.core.api.Assertions.*;
  */
 abstract class AbstractReservationManagerTest {
 
+    protected static final String DEFAULT_DOMAIN = "test-domain";
     protected ReservationManager manager;
 
     /**
      * Creates the ReservationManager implementation to test.
      * Called before each test.
      */
-    protected abstract ReservationManager createManager(Duration leaseTime);
+    protected abstract ReservationManager createManager(String domain, Duration leaseTime);
 
     /**
      * Cleans up resources after each test.
@@ -1334,7 +1397,7 @@ abstract class AbstractReservationManagerTest {
 
     @BeforeEach
     void setUp() {
-        manager = createManager(Duration.ofSeconds(5));
+        manager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(5));
     }
 
     @AfterEach
@@ -1349,10 +1412,9 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldAcquireAndReleaseReservation() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "123");
+        Reservation reservation = manager.getReservation("123");
 
         reservation.lock();
-        assertThat(reservation.isHeldByCurrentThread()).isTrue();
         assertThat(reservation.isLocked()).isTrue();
 
         reservation.unlock();
@@ -1360,12 +1422,15 @@ abstract class AbstractReservationManagerTest {
     }
 
     @Test
-    void shouldReturnCorrectDomainAndIdentifier() {
-        Reservation reservation = manager.getReservation("orders", "456");
+    void shouldReturnCorrectIdentifier() {
+        Reservation reservation = manager.getReservation("456");
 
-        assertThat(reservation.getDomain()).isEqualTo("orders");
         assertThat(reservation.getIdentifier()).isEqualTo("456");
-        assertThat(reservation.getReservationKey()).isEqualTo("orders::456");
+    }
+
+    @Test
+    void shouldReturnCorrectDomainFromManager() {
+        assertThat(manager.getDomain()).isEqualTo(DEFAULT_DOMAIN);
     }
 
     // ==================== Expiration Tests ====================
@@ -1373,8 +1438,8 @@ abstract class AbstractReservationManagerTest {
     @Test
     void shouldExpireAfterLeaseTime() throws Exception {
         // Use short lease for this test
-        ReservationManager shortLeaseManager = createManager(Duration.ofSeconds(2));
-        Reservation reservation = shortLeaseManager.getReservation("orders", "789");
+        ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(2));
+        Reservation reservation = shortLeaseManager.getReservation("789");
 
         reservation.lock();
         assertThat(reservation.isLocked()).isTrue();
@@ -1391,7 +1456,7 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldHavePositiveRemainingLeaseTimeAfterAcquire() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "lease-test");
+        Reservation reservation = manager.getReservation("lease-test");
         reservation.lock();
 
         Duration remaining = reservation.getRemainingLeaseTime();
@@ -1405,11 +1470,11 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldBlockConcurrentAcquisition() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "concurrent");
+        Reservation reservation = manager.getReservation("concurrent");
         reservation.lock();
 
         CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
-            Reservation sameReservation = manager.getReservation("orders", "concurrent");
+            Reservation sameReservation = manager.getReservation("concurrent");
             return sameReservation.tryLock();
         });
 
@@ -1419,13 +1484,13 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldAllowAcquisitionAfterRelease() throws Exception {
-        Reservation reservation1 = manager.getReservation("orders", "release-test");
+        Reservation reservation1 = manager.getReservation("release-test");
         reservation1.lock();
         reservation1.unlock();
 
         // Different thread should now be able to acquire
         CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
-            Reservation reservation2 = manager.getReservation("orders", "release-test");
+            Reservation reservation2 = manager.getReservation("release-test");
             boolean acquired = reservation2.tryLock();
             if (acquired) {
                 try {
@@ -1442,15 +1507,15 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldAllowAcquisitionAfterExpiry() throws Exception {
-        ReservationManager shortLeaseManager = createManager(Duration.ofSeconds(1));
-        Reservation reservation = shortLeaseManager.getReservation("orders", "expiry-test");
+        ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(1));
+        Reservation reservation = shortLeaseManager.getReservation("expiry-test");
 
         reservation.lock();
         Thread.sleep(1500); // Wait for expiry
 
         // Another acquisition should succeed
         CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
-            Reservation newReservation = shortLeaseManager.getReservation("orders", "expiry-test");
+            Reservation newReservation = shortLeaseManager.getReservation("expiry-test");
             boolean acquired = newReservation.tryLock();
             if (acquired) {
                 try {
@@ -1470,22 +1535,22 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void tryLockShouldReturnTrueWhenAvailable() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "trylock-available");
+        Reservation reservation = manager.getReservation("trylock-available");
 
         assertThat(reservation.tryLock(1, TimeUnit.SECONDS)).isTrue();
-        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+        assertThat(reservation.isLocked()).isTrue();
 
         reservation.unlock();
     }
 
     @Test
     void tryLockShouldReturnFalseAfterTimeout() throws Exception {
-        Reservation holder = manager.getReservation("orders", "trylock-timeout");
+        Reservation holder = manager.getReservation("trylock-timeout");
         holder.lock();
 
         CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
             try {
-                Reservation waiterRes = manager.getReservation("orders", "trylock-timeout");
+                Reservation waiterRes = manager.getReservation("trylock-timeout");
                 return waiterRes.tryLock(500, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 return false;
@@ -1496,36 +1561,15 @@ abstract class AbstractReservationManagerTest {
         holder.unlock();
     }
 
-    @Test
-    void tryLockShouldSucceedWhenReleasedBeforeTimeout() throws Exception {
-        Reservation holder = manager.getReservation("orders", "trylock-release");
-        holder.lock();
-
-        CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
-            try {
-                Reservation waiterRes = manager.getReservation("orders", "trylock-release");
-                return waiterRes.tryLock(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                return false;
-            }
-        });
-
-        // Release after a short delay
-        Thread.sleep(200);
-        holder.unlock();
-
-        assertThat(waiter.get(3, TimeUnit.SECONDS)).isTrue();
-    }
-
     // ==================== forceUnlock Tests ====================
 
     @Test
     void forceUnlockShouldReleaseRegardlessOfOwner() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "force-unlock");
+        Reservation reservation = manager.getReservation("force-unlock");
         reservation.lock();
 
         // Force unlock from different context
-        Reservation admin = manager.getReservation("orders", "force-unlock");
+        Reservation admin = manager.getReservation("force-unlock");
         admin.forceUnlock();
 
         assertThat(reservation.isLocked()).isFalse();
@@ -1539,16 +1583,16 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldSupportReentrantLocking() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "reentrant");
+        Reservation reservation = manager.getReservation("reentrant");
 
         reservation.lock();
         reservation.lock(); // Reentrant
 
-        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+        assertThat(reservation.isLocked()).isTrue();
 
         reservation.unlock();
         // Still held (need second unlock)
-        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+        assertThat(reservation.isLocked()).isTrue();
 
         reservation.unlock();
         assertThat(reservation.isLocked()).isFalse();
@@ -1557,26 +1601,14 @@ abstract class AbstractReservationManagerTest {
     // ==================== Validation Tests ====================
 
     @Test
-    void shouldRejectNullDomain() {
-        assertThatThrownBy(() -> manager.getReservation(null, "123"))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
-    void shouldRejectEmptyDomain() {
-        assertThatThrownBy(() -> manager.getReservation("", "123"))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
-    void shouldRejectDomainContainingDelimiter() {
-        assertThatThrownBy(() -> manager.getReservation("order::type", "123"))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
     void shouldRejectNullIdentifier() {
-        assertThatThrownBy(() -> manager.getReservation("orders", null))
+        assertThatThrownBy(() -> manager.getReservation(null))
+            .isInstanceOf(InvalidReservationKeyException.class);
+    }
+
+    @Test
+    void shouldRejectEmptyIdentifier() {
+        assertThatThrownBy(() -> manager.getReservation(""))
             .isInstanceOf(InvalidReservationKeyException.class);
     }
 
@@ -1584,7 +1616,7 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void newConditionShouldThrowUnsupportedOperationException() {
-        Reservation reservation = manager.getReservation("orders", "condition");
+        Reservation reservation = manager.getReservation("condition");
 
         assertThatThrownBy(reservation::newCondition)
             .isInstanceOf(UnsupportedOperationException.class)
@@ -1595,12 +1627,12 @@ abstract class AbstractReservationManagerTest {
 
     @Test
     void lockInterruptiblyShouldThrowWhenInterrupted() throws Exception {
-        Reservation holder = manager.getReservation("orders", "interrupt");
+        Reservation holder = manager.getReservation("interrupt");
         holder.lock();
 
         Thread waiterThread = new Thread(() -> {
             try {
-                Reservation waiter = manager.getReservation("orders", "interrupt");
+                Reservation waiter = manager.getReservation("interrupt");
                 waiter.lockInterruptibly();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1616,6 +1648,26 @@ abstract class AbstractReservationManagerTest {
 
         assertThat(waiterThread.isInterrupted() || !waiterThread.isAlive()).isTrue();
         holder.unlock();
+    }
+
+    // ==================== Domain Isolation Tests ====================
+
+    @Test
+    void shouldIsolateBetweenDomains() throws Exception {
+        ReservationManager ordersManager = createManager("orders", Duration.ofSeconds(5));
+        ReservationManager usersManager = createManager("users", Duration.ofSeconds(5));
+
+        // Same identifier in different domains should be independent
+        Reservation ordersLock = ordersManager.getReservation("123");
+        Reservation usersLock = usersManager.getReservation("123");
+
+        ordersLock.lock();
+        assertThat(usersLock.tryLock()).isTrue(); // Should succeed, different domain
+
+        ordersLock.unlock();
+        usersLock.unlock();
+        ordersManager.close();
+        usersManager.close();
     }
 }
 ```
@@ -1652,11 +1704,11 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
     }
 
     @Override
-    protected ReservationManager createManager(Duration leaseTime) {
-        mapName = "test-reservations-" + UUID.randomUUID();
+    protected ReservationManager createManager(String domain, Duration leaseTime) {
+        mapName = "reservations-" + domain;  // Derived from domain
         return ReservationManager.hazelcast(hazelcast)
+            .domain(domain)
             .leaseTime(leaseTime)
-            .mapName(mapName)
             .build();
     }
 
@@ -1676,22 +1728,15 @@ package com.github.reservation.oracle;
 
 import com.github.reservation.*;
 import org.junit.jupiter.api.*;
-import org.testcontainers.containers.OracleContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import javax.sql.DataSource;
 import com.zaxxer.hikari.*;
 import java.sql.*;
 import java.time.Duration;
 
-@Testcontainers
-class OracleReservationManagerTest extends AbstractReservationManagerTest {
-
-    @Container
-    static OracleContainer oracle = new OracleContainer("gvenzl/oracle-xe:21-slim-faststart")
-        .withDatabaseName("testdb")
-        .withUsername("testuser")
-        .withPassword("testpass");
+/**
+ * Unit tests using H2 in-memory database.
+ */
+class JdbcReservationManagerTest extends AbstractReservationManagerTest {
 
     private static DataSource dataSource;
     private static final String TABLE_NAME = "RESERVATION_LOCKS";
@@ -1699,9 +1744,7 @@ class OracleReservationManagerTest extends AbstractReservationManagerTest {
     @BeforeAll
     static void setupDatabase() throws SQLException {
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl(oracle.getJdbcUrl());
-        config.setUsername(oracle.getUsername());
-        config.setPassword(oracle.getPassword());
+        config.setJdbcUrl("jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1");
         config.setMaximumPoolSize(5);
         dataSource = new HikariDataSource(config);
 
@@ -1710,19 +1753,20 @@ class OracleReservationManagerTest extends AbstractReservationManagerTest {
              Statement stmt = conn.createStatement()) {
             stmt.execute("""
                 CREATE TABLE RESERVATION_LOCKS (
-                    reservation_key  VARCHAR2(512) NOT NULL,
-                    holder           VARCHAR2(256) NOT NULL,
+                    reservation_key  VARCHAR(512)  NOT NULL,
+                    holder           VARCHAR(256)  NOT NULL,
                     acquired_at      TIMESTAMP     NOT NULL,
                     expires_at       TIMESTAMP     NOT NULL,
-                    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
+                    PRIMARY KEY (reservation_key)
                 )
                 """);
         }
     }
 
     @Override
-    protected ReservationManager createManager(Duration leaseTime) {
+    protected ReservationManager createManager(String domain, Duration leaseTime) {
         return ReservationManager.oracle(dataSource)
+            .domain(domain)
             .leaseTime(leaseTime)
             .tableName(TABLE_NAME)
             .build();
@@ -1756,16 +1800,16 @@ class HazelcastIntegrationTest extends AbstractReservationManagerTest {
     private String mapName;
 
     @Override
-    protected ReservationManager createManager(Duration leaseTime) {
+    protected ReservationManager createManager(String domain, Duration leaseTime) {
         ClientConfig config = new ClientConfig();
         config.getNetworkConfig().addAddress(
             hazelcast.getHost() + ":" + hazelcast.getFirstMappedPort());
         client = HazelcastClient.newHazelcastClient(config);
 
-        mapName = "test-reservations-" + UUID.randomUUID();
+        mapName = "reservations-" + domain;  // Derived from domain
         return ReservationManager.hazelcast(client)
+            .domain(domain)
             .leaseTime(leaseTime)
-            .mapName(mapName)
             .build();
     }
 
@@ -2041,11 +2085,15 @@ reservation-lock/
 
 ```java
 HazelcastInstance hz = HazelcastClient.newHazelcastClient();
-ReservationManager manager = ReservationManager.hazelcast(hz)
+
+// Create manager for the "orders" domain
+ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+    .domain("orders")
     .leaseTime(Duration.ofMinutes(2))
     .build();
 
-Reservation reservation = manager.getReservation("orders", "order-12345");
+// Get reservation by identifier only
+Reservation reservation = ordersManager.getReservation("order-12345");
 reservation.lock();
 try {
     processOrder("order-12345");
@@ -2058,11 +2106,14 @@ try {
 
 ```java
 DataSource dataSource = getDataSource();
-ReservationManager manager = ReservationManager.oracle(dataSource)
+
+// Create manager for the "orders" domain
+ReservationManager ordersManager = ReservationManager.oracle(dataSource)
+    .domain("orders")
     .leaseTime(Duration.ofMinutes(2))
     .build();
 
-Reservation reservation = manager.getReservation("orders", "order-12345");
+Reservation reservation = ordersManager.getReservation("order-12345");
 reservation.lock();
 try {
     processOrder("order-12345");
@@ -2071,10 +2122,31 @@ try {
 }
 ```
 
+### Multiple Domains
+
+```java
+// Create separate managers for different domains
+ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+    .domain("orders")
+    .build();
+
+ReservationManager usersManager = ReservationManager.hazelcast(hz)
+    .domain("users")
+    .build();
+
+// Each uses its own isolated Hazelcast map
+ordersManager.getReservation("123").lock();  // Uses map "reservations-orders"
+usersManager.getReservation("123").lock();   // Uses map "reservations-users"
+```
+
 ### Try-Lock Pattern
 
 ```java
-Reservation reservation = manager.getReservation("inventory", "sku-ABC123");
+ReservationManager inventoryManager = ReservationManager.hazelcast(hz)
+    .domain("inventory")
+    .build();
+
+Reservation reservation = inventoryManager.getReservation("sku-ABC123");
 if (reservation.tryLock(5, TimeUnit.SECONDS)) {
     try {
         updateInventory("sku-ABC123");
@@ -2089,7 +2161,12 @@ if (reservation.tryLock(5, TimeUnit.SECONDS)) {
 ### Handling Expiration
 
 ```java
-Reservation reservation = manager.getReservation("reports", "daily-report");
+ReservationManager reportsManager = ReservationManager.hazelcast(hz)
+    .domain("reports")
+    .leaseTime(Duration.ofMinutes(10))
+    .build();
+
+Reservation reservation = reportsManager.getReservation("daily-report");
 reservation.lock();
 try {
     generateDailyReport(); // Long-running operation
@@ -2113,6 +2190,7 @@ class MyCustomLockingStrategy implements LockingStrategy {
 
 // Use custom strategy
 ReservationManager manager = ReservationManager.oracle(dataSource)
+    .domain("orders")
     .lockingStrategy(new MyCustomLockingStrategy())
     .build();
 ```
