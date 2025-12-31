@@ -60,15 +60,13 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
 
     @Test
     void shouldStoreDebugValueInMap() {
-        HazelcastReservationManager hzManager = (HazelcastReservationManager) manager;
-
         var reservation = manager.getReservation("orders", "debug-test");
         reservation.lock();
 
         try {
             String value = hazelcast.getMap(mapName).get("orders::debug-test").toString();
-            assertThat(value).contains("holder=");
-            assertThat(value).contains("acquired=");
+            org.assertj.core.api.Assertions.assertThat(value).contains("holder=");
+            org.assertj.core.api.Assertions.assertThat(value).contains("acquired=");
         } finally {
             reservation.unlock();
         }
@@ -77,10 +75,6 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
     @Test
     void shouldReturnCorrectMapName() {
         HazelcastReservationManager hzManager = (HazelcastReservationManager) manager;
-        assertThat(hzManager.getMapName()).isEqualTo(mapName);
-    }
-
-    private void assertThat(String value) {
-        org.assertj.core.api.Assertions.assertThat(value);
+        org.assertj.core.api.Assertions.assertThat(hzManager.getMapName()).isEqualTo(mapName);
     }
 }

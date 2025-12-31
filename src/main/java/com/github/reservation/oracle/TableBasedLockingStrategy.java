@@ -112,17 +112,23 @@ public class TableBasedLockingStrategy implements LockingStrategy {
 
     @Override
     public boolean release(String reservationKey, String holder) throws LockingException {
+        // Only release if the lock exists AND is not expired AND is owned by holder
+        String releaseIfValidSql = String.format(
+            "DELETE FROM %s WHERE reservation_key = ? AND holder = ? AND expires_at > ?",
+            tableName);
+
         try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(deleteSql)) {
+             PreparedStatement ps = conn.prepareStatement(releaseIfValidSql)) {
             ps.setString(1, reservationKey);
             ps.setString(2, holder);
+            ps.setTimestamp(3, Timestamp.from(Instant.now()));
             int deleted = ps.executeUpdate();
 
             if (deleted > 0) {
                 log.debug("Released lock: {} by {}", reservationKey, holder);
                 return true;
             } else {
-                log.debug("Lock not found or not owned: {} by {}", reservationKey, holder);
+                log.debug("Lock not found, not owned, or expired: {} by {}", reservationKey, holder);
                 return false;
             }
         } catch (SQLException e) {
