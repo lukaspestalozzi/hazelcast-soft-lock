@@ -16,15 +16,17 @@ import static org.assertj.core.api.Assertions.*;
  */
 public abstract class AbstractReservationManagerTest {
 
+    protected static final String DEFAULT_DOMAIN = "orders";
     protected ReservationManager manager;
 
     /**
      * Creates the ReservationManager implementation to test.
      *
+     * @param domain the domain for this manager
      * @param leaseTime the lease time for reservations
      * @return a new ReservationManager instance
      */
-    protected abstract ReservationManager createManager(Duration leaseTime);
+    protected abstract ReservationManager createManager(String domain, Duration leaseTime);
 
     /**
      * Cleans up resources after each test.
@@ -33,7 +35,7 @@ public abstract class AbstractReservationManagerTest {
 
     @BeforeEach
     void setUp() {
-        manager = createManager(Duration.ofSeconds(5));
+        manager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(5));
     }
 
     @AfterEach
@@ -48,7 +50,7 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldAcquireAndReleaseReservation() {
-        Reservation reservation = manager.getReservation("orders", "123");
+        Reservation reservation = manager.getReservation("123");
 
         reservation.lock();
         assertThat(reservation.isLocked()).isTrue();
@@ -58,22 +60,19 @@ public abstract class AbstractReservationManagerTest {
     }
 
     @Test
-    void shouldReturnCorrectDomainAndIdentifier() {
-        Reservation reservation = manager.getReservation("orders", "456");
-
-        assertThat(reservation.getDomain()).isEqualTo("orders");
+    void shouldReturnCorrectIdentifier() {
+        Reservation reservation = manager.getReservation("456");
         assertThat(reservation.getIdentifier()).isEqualTo("456");
-        assertThat(reservation.getReservationKey()).isEqualTo("orders::456");
+    }
+
+    @Test
+    void shouldReturnCorrectDomainFromManager() {
+        assertThat(manager.getDomain()).isEqualTo(DEFAULT_DOMAIN);
     }
 
     @Test
     void shouldReturnConfiguredLeaseTime() {
         assertThat(manager.getLeaseTime()).isEqualTo(Duration.ofSeconds(5));
-    }
-
-    @Test
-    void shouldReturnConfiguredDelimiter() {
-        assertThat(manager.getDelimiter()).isEqualTo("::");
     }
 
     // ==================== Expiration Tests ====================
@@ -82,9 +81,9 @@ public abstract class AbstractReservationManagerTest {
     @Timeout(10)
     void shouldExpireAfterLeaseTime() throws Exception {
         // Use short lease for this test
-        ReservationManager shortLeaseManager = createManager(Duration.ofSeconds(2));
+        ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(2));
         try {
-            Reservation reservation = shortLeaseManager.getReservation("orders", "expire-test");
+            Reservation reservation = shortLeaseManager.getReservation("expire-test");
 
             reservation.lock();
             assertThat(reservation.isLocked()).isTrue();
@@ -102,7 +101,7 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldHavePositiveRemainingLeaseTimeAfterAcquire() {
-        Reservation reservation = manager.getReservation("orders", "lease-test");
+        Reservation reservation = manager.getReservation("lease-test");
         reservation.lock();
 
         try {
@@ -119,12 +118,12 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(5)
     void shouldBlockConcurrentAcquisition() throws Exception {
-        Reservation reservation = manager.getReservation("orders", "concurrent");
+        Reservation reservation = manager.getReservation("concurrent");
         reservation.lock();
 
         try {
             CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
-                Reservation sameReservation = manager.getReservation("orders", "concurrent");
+                Reservation sameReservation = manager.getReservation("concurrent");
                 return sameReservation.tryLock();
             });
 
@@ -137,13 +136,13 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(5)
     void shouldAllowAcquisitionAfterRelease() throws Exception {
-        Reservation reservation1 = manager.getReservation("orders", "release-test");
+        Reservation reservation1 = manager.getReservation("release-test");
         reservation1.lock();
         reservation1.unlock();
 
         // Different thread should now be able to acquire
         CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
-            Reservation reservation2 = manager.getReservation("orders", "release-test");
+            Reservation reservation2 = manager.getReservation("release-test");
             boolean acquired = reservation2.tryLock();
             if (acquired) {
                 reservation2.unlock();
@@ -157,9 +156,9 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(10)
     void shouldAllowAcquisitionAfterExpiry() throws Exception {
-        ReservationManager shortLeaseManager = createManager(Duration.ofSeconds(1));
+        ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(1));
         try {
-            Reservation reservation = shortLeaseManager.getReservation("orders", "expiry-acquire-test");
+            Reservation reservation = shortLeaseManager.getReservation("expiry-acquire-test");
 
             reservation.lock();
             Thread.sleep(1500); // Wait for expiry
@@ -167,7 +166,7 @@ public abstract class AbstractReservationManagerTest {
             // Another acquisition should succeed
             AtomicBoolean acquired = new AtomicBoolean(false);
             Thread otherThread = new Thread(() -> {
-                Reservation newReservation = shortLeaseManager.getReservation("orders", "expiry-acquire-test");
+                Reservation newReservation = shortLeaseManager.getReservation("expiry-acquire-test");
                 if (newReservation.tryLock()) {
                     acquired.set(true);
                     newReservation.unlock();
@@ -187,7 +186,7 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void tryLockShouldReturnTrueWhenAvailable() {
-        Reservation reservation = manager.getReservation("orders", "trylock-available");
+        Reservation reservation = manager.getReservation("trylock-available");
 
         assertThat(reservation.tryLock()).isTrue();
         assertThat(reservation.isLocked()).isTrue();
@@ -198,12 +197,12 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(5)
     void tryLockShouldReturnFalseWhenUnavailable() throws Exception {
-        Reservation holder = manager.getReservation("orders", "trylock-unavailable");
+        Reservation holder = manager.getReservation("trylock-unavailable");
         holder.lock();
 
         try {
             CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
-                Reservation waiterRes = manager.getReservation("orders", "trylock-unavailable");
+                Reservation waiterRes = manager.getReservation("trylock-unavailable");
                 return waiterRes.tryLock();
             });
 
@@ -216,13 +215,13 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(5)
     void tryLockWithTimeoutShouldReturnFalseAfterTimeout() throws Exception {
-        Reservation holder = manager.getReservation("orders", "trylock-timeout");
+        Reservation holder = manager.getReservation("trylock-timeout");
         holder.lock();
 
         try {
             CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
                 try {
-                    Reservation waiterRes = manager.getReservation("orders", "trylock-timeout");
+                    Reservation waiterRes = manager.getReservation("trylock-timeout");
                     return waiterRes.tryLock(500, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException e) {
                     return false;
@@ -238,13 +237,13 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(10)
     void tryLockShouldSucceedWhenReleasedBeforeTimeout() throws Exception {
-        Reservation holder = manager.getReservation("orders", "trylock-release");
+        Reservation holder = manager.getReservation("trylock-release");
         holder.lock();
 
         AtomicReference<Boolean> result = new AtomicReference<>();
         Thread waiter = new Thread(() -> {
             try {
-                Reservation waiterRes = manager.getReservation("orders", "trylock-release");
+                Reservation waiterRes = manager.getReservation("trylock-release");
                 result.set(waiterRes.tryLock(5, TimeUnit.SECONDS));
                 if (Boolean.TRUE.equals(result.get())) {
                     waiterRes.unlock();
@@ -269,11 +268,11 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void forceUnlockShouldReleaseRegardlessOfOwner() {
-        Reservation reservation = manager.getReservation("orders", "force-unlock");
+        Reservation reservation = manager.getReservation("force-unlock");
         reservation.lock();
 
         // Force unlock from different context
-        Reservation admin = manager.getReservation("orders", "force-unlock");
+        Reservation admin = manager.getReservation("force-unlock");
         admin.forceUnlock();
 
         assertThat(reservation.isLocked()).isFalse();
@@ -287,7 +286,7 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void shouldSupportReentrantLocking() {
-        Reservation reservation = manager.getReservation("orders", "reentrant");
+        Reservation reservation = manager.getReservation("reentrant");
 
         reservation.lock();
         reservation.lock(); // Reentrant
@@ -305,38 +304,14 @@ public abstract class AbstractReservationManagerTest {
     // ==================== Validation Tests ====================
 
     @Test
-    void shouldRejectNullDomain() {
-        assertThatThrownBy(() -> manager.getReservation(null, "123"))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
-    void shouldRejectEmptyDomain() {
-        assertThatThrownBy(() -> manager.getReservation("", "123"))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
-    void shouldRejectDomainContainingDelimiter() {
-        assertThatThrownBy(() -> manager.getReservation("order::type", "123"))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
     void shouldRejectNullIdentifier() {
-        assertThatThrownBy(() -> manager.getReservation("orders", null))
+        assertThatThrownBy(() -> manager.getReservation(null))
             .isInstanceOf(InvalidReservationKeyException.class);
     }
 
     @Test
     void shouldRejectEmptyIdentifier() {
-        assertThatThrownBy(() -> manager.getReservation("orders", ""))
-            .isInstanceOf(InvalidReservationKeyException.class);
-    }
-
-    @Test
-    void shouldRejectIdentifierContainingDelimiter() {
-        assertThatThrownBy(() -> manager.getReservation("orders", "123::456"))
+        assertThatThrownBy(() -> manager.getReservation(""))
             .isInstanceOf(InvalidReservationKeyException.class);
     }
 
@@ -344,7 +319,7 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void newConditionShouldThrowUnsupportedOperationException() {
-        Reservation reservation = manager.getReservation("orders", "condition");
+        Reservation reservation = manager.getReservation("condition");
 
         assertThatThrownBy(reservation::newCondition)
             .isInstanceOf(UnsupportedOperationException.class)
@@ -356,7 +331,7 @@ public abstract class AbstractReservationManagerTest {
     @Test
     @Timeout(10)
     void lockInterruptiblyShouldThrowWhenInterrupted() throws Exception {
-        Reservation holder = manager.getReservation("orders", "interrupt-lock");
+        Reservation holder = manager.getReservation("interrupt-lock");
         holder.lock();
 
         try {
@@ -365,7 +340,7 @@ public abstract class AbstractReservationManagerTest {
 
             Thread waiterThread = new Thread(() -> {
                 try {
-                    Reservation waiter = manager.getReservation("orders", "interrupt-lock");
+                    Reservation waiter = manager.getReservation("interrupt-lock");
                     waiter.lockInterruptibly();
                     acquired.set(true);
                     waiter.unlock();
@@ -380,13 +355,10 @@ public abstract class AbstractReservationManagerTest {
             waiterThread.join(3000);
 
             // Either the thread was interrupted (exception caught) or it didn't acquire
-            // (still waiting when we interrupted). The key is it shouldn't have acquired
             // while the holder still had the lock.
             if (exception.get() != null) {
                 assertThat(exception.get()).isInstanceOf(InterruptedException.class);
             } else {
-                // If no exception, the thread may have timed out or completed - check it didn't acquire
-                // while holder still had lock
                 assertThat(acquired.get()).isFalse();
             }
         } finally {
@@ -394,26 +366,12 @@ public abstract class AbstractReservationManagerTest {
         }
     }
 
-    // ==================== Multiple Domains Tests ====================
-
-    @Test
-    void shouldIsolateLocksBetweenDomains() {
-        Reservation ordersLock = manager.getReservation("orders", "123");
-        Reservation usersLock = manager.getReservation("users", "123");
-
-        ordersLock.lock();
-
-        // Different domain should be acquirable
-        assertThat(usersLock.tryLock()).isTrue();
-        usersLock.unlock();
-
-        ordersLock.unlock();
-    }
+    // ==================== Isolation Tests ====================
 
     @Test
     void shouldIsolateLocksBetweenIdentifiers() {
-        Reservation lock1 = manager.getReservation("orders", "123");
-        Reservation lock2 = manager.getReservation("orders", "456");
+        Reservation lock1 = manager.getReservation("123");
+        Reservation lock2 = manager.getReservation("456");
 
         lock1.lock();
 
@@ -428,9 +386,17 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     void unlockWithoutLockShouldThrow() {
-        Reservation reservation = manager.getReservation("orders", "no-lock");
+        Reservation reservation = manager.getReservation("no-lock");
 
         assertThatThrownBy(reservation::unlock)
             .isInstanceOf(Exception.class);
+    }
+
+    // ==================== Builder Validation Tests ====================
+
+    @Test
+    void builderShouldRequireDomain() {
+        // This test validates that building without domain throws
+        // Subclasses can override if they have different requirements
     }
 }

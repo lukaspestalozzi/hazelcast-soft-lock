@@ -1,8 +1,8 @@
 package com.github.reservation.hazelcast;
 
+import com.github.reservation.InvalidReservationKeyException;
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationManager;
-import com.github.reservation.internal.ReservationKeyBuilder;
 import com.github.reservation.internal.ReservationMetrics;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
@@ -12,53 +12,54 @@ import java.time.Duration;
 
 /**
  * Hazelcast-backed implementation of {@link ReservationManager}.
+ *
+ * <p>Each manager handles a single domain and uses a dedicated IMap for that domain.</p>
  */
 public final class HazelcastReservationManager implements ReservationManager {
 
     private final HazelcastInstance hazelcastInstance;
     private final IMap<String, String> lockMap;
+    private final String domain;
     private final Duration leaseTime;
-    private final String delimiter;
     private final String mapName;
-    private final ReservationKeyBuilder keyBuilder;
     private final ReservationMetrics metrics;
 
     HazelcastReservationManager(
             HazelcastInstance hazelcastInstance,
+            String domain,
             Duration leaseTime,
-            String delimiter,
             String mapName,
             MeterRegistry meterRegistry) {
         this.hazelcastInstance = hazelcastInstance;
+        this.domain = domain;
         this.lockMap = hazelcastInstance.getMap(mapName);
         this.leaseTime = leaseTime;
-        this.delimiter = delimiter;
         this.mapName = mapName;
-        this.keyBuilder = new ReservationKeyBuilder(delimiter);
         this.metrics = new ReservationMetrics(meterRegistry, "hazelcast");
     }
 
     @Override
-    public Reservation getReservation(String domain, String identifier) {
-        String reservationKey = keyBuilder.buildKey(domain, identifier);
+    public Reservation getReservation(String identifier) {
+        if (identifier == null || identifier.isEmpty()) {
+            throw new InvalidReservationKeyException("identifier must not be null or empty");
+        }
         return new HazelcastReservation(
             lockMap,
             domain,
             identifier,
-            reservationKey,
             leaseTime,
             metrics
         );
     }
 
     @Override
-    public Duration getLeaseTime() {
-        return leaseTime;
+    public String getDomain() {
+        return domain;
     }
 
     @Override
-    public String getDelimiter() {
-        return delimiter;
+    public Duration getLeaseTime() {
+        return leaseTime;
     }
 
     /**

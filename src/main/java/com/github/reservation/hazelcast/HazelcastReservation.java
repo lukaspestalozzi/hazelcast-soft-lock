@@ -24,7 +24,6 @@ final class HazelcastReservation implements Reservation {
     private final IMap<String, String> lockMap;
     private final String domain;
     private final String identifier;
-    private final String reservationKey;
     private final Duration leaseTime;
     private final ReservationMetrics metrics;
 
@@ -35,20 +34,13 @@ final class HazelcastReservation implements Reservation {
             IMap<String, String> lockMap,
             String domain,
             String identifier,
-            String reservationKey,
             Duration leaseTime,
             ReservationMetrics metrics) {
         this.lockMap = lockMap;
         this.domain = domain;
         this.identifier = identifier;
-        this.reservationKey = reservationKey;
         this.leaseTime = leaseTime;
         this.metrics = metrics;
-    }
-
-    @Override
-    public String getDomain() {
-        return domain;
     }
 
     @Override
@@ -58,12 +50,14 @@ final class HazelcastReservation implements Reservation {
 
     @Override
     public String getReservationKey() {
-        return reservationKey;
+        // In single-domain mode, the key is just the identifier
+        // (the domain isolation is handled by using separate maps)
+        return identifier;
     }
 
     @Override
     public Duration getRemainingLeaseTime() {
-        if (acquiredAt == null || !isHeldByCurrentThread()) {
+        if (acquiredAt == null) {
             return Duration.ZERO;
         }
         Duration elapsed = Duration.between(acquiredAt, Instant.now());
@@ -73,22 +67,14 @@ final class HazelcastReservation implements Reservation {
 
     @Override
     public boolean isLocked() {
-        return lockMap.isLocked(reservationKey);
-    }
-
-    @Override
-    public boolean isHeldByCurrentThread() {
-        // Hazelcast doesn't provide a direct way to check this,
-        // so we try to check if we can unlock (which would fail if not owner)
-        // But a simpler approach: we track ownership locally and verify with isLocked
-        return lockMap.isLocked(reservationKey) && acquiredAt != null;
+        return lockMap.isLocked(identifier);
     }
 
     @Override
     public void forceUnlock() {
-        log.warn("Force unlocking reservation: {}", reservationKey);
-        lockMap.remove(reservationKey);
-        lockMap.forceUnlock(reservationKey);
+        log.warn("Force unlocking reservation: {}", identifier);
+        lockMap.remove(identifier);
+        lockMap.forceUnlock(identifier);
         acquiredAt = null;
     }
 
@@ -97,18 +83,18 @@ final class HazelcastReservation implements Reservation {
         Instant start = Instant.now();
         try {
             // Acquire the Hazelcast lock with lease time
-            lockMap.lock(reservationKey, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
             acquiredAt = Instant.now();
 
             // Store debug value
             String value = buildDebugValue();
-            lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             Duration elapsed = Duration.between(start, Instant.now());
             metrics.recordAcquisition(domain, elapsed, "acquired");
             metrics.recordAcquisitionAttempt(domain, true);
 
-            log.debug("Acquired reservation: {}", reservationKey);
+            log.debug("Acquired reservation: {}", identifier);
 
         } catch (Exception e) {
             Duration elapsed = Duration.between(start, Instant.now());
@@ -129,17 +115,17 @@ final class HazelcastReservation implements Reservation {
         Instant start = Instant.now();
         try {
             // Hazelcast's lock() is interruptible
-            lockMap.lock(reservationKey, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
             acquiredAt = Instant.now();
 
             String value = buildDebugValue();
-            lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             Duration elapsed = Duration.between(start, Instant.now());
             metrics.recordAcquisition(domain, elapsed, "acquired");
             metrics.recordAcquisitionAttempt(domain, true);
 
-            log.debug("Acquired reservation (interruptibly): {}", reservationKey);
+            log.debug("Acquired reservation (interruptibly): {}", identifier);
 
         } catch (Exception e) {
             Duration elapsed = Duration.between(start, Instant.now());
@@ -161,25 +147,25 @@ final class HazelcastReservation implements Reservation {
     public boolean tryLock() {
         Instant start = Instant.now();
         try {
-            boolean acquired = lockMap.tryLock(reservationKey, 0, TimeUnit.MILLISECONDS,
+            boolean acquired = lockMap.tryLock(identifier, 0, TimeUnit.MILLISECONDS,
                 leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             if (acquired) {
                 acquiredAt = Instant.now();
                 String value = buildDebugValue();
-                lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+                lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
                 Duration elapsed = Duration.between(start, Instant.now());
                 metrics.recordAcquisition(domain, elapsed, "acquired");
                 metrics.recordAcquisitionAttempt(domain, true);
 
-                log.debug("Try-locked reservation: {}", reservationKey);
+                log.debug("Try-locked reservation: {}", identifier);
             } else {
                 Duration elapsed = Duration.between(start, Instant.now());
                 metrics.recordAcquisition(domain, elapsed, "unavailable");
                 metrics.recordAcquisitionAttempt(domain, false);
 
-                log.debug("Try-lock failed, reservation unavailable: {}", reservationKey);
+                log.debug("Try-lock failed, reservation unavailable: {}", identifier);
             }
 
             return acquired;
@@ -188,7 +174,7 @@ final class HazelcastReservation implements Reservation {
             Thread.currentThread().interrupt();
             return false;
         } catch (Exception e) {
-            log.warn("Error during tryLock for {}: {}", reservationKey, e.getMessage());
+            log.warn("Error during tryLock for {}: {}", identifier, e.getMessage());
             return false;
         }
     }
@@ -201,7 +187,7 @@ final class HazelcastReservation implements Reservation {
 
         Instant start = Instant.now();
         try {
-            boolean acquired = lockMap.tryLock(reservationKey, time, unit,
+            boolean acquired = lockMap.tryLock(identifier, time, unit,
                 leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             Duration elapsed = Duration.between(start, Instant.now());
@@ -209,17 +195,17 @@ final class HazelcastReservation implements Reservation {
             if (acquired) {
                 acquiredAt = Instant.now();
                 String value = buildDebugValue();
-                lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+                lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
                 metrics.recordAcquisition(domain, elapsed, "acquired");
                 metrics.recordAcquisitionAttempt(domain, true);
 
-                log.debug("Try-locked reservation with timeout: {}", reservationKey);
+                log.debug("Try-locked reservation with timeout: {}", identifier);
             } else {
                 metrics.recordAcquisition(domain, elapsed, "timeout");
                 metrics.recordAcquisitionAttempt(domain, false);
 
-                log.debug("Try-lock timed out for reservation: {}", reservationKey);
+                log.debug("Try-lock timed out for reservation: {}", identifier);
             }
 
             return acquired;
@@ -235,10 +221,10 @@ final class HazelcastReservation implements Reservation {
     public void unlock() {
         try {
             // Remove the debug value first
-            lockMap.remove(reservationKey);
+            lockMap.remove(identifier);
 
             // Then release the lock
-            lockMap.unlock(reservationKey);
+            lockMap.unlock(identifier);
 
             if (acquiredAt != null) {
                 Duration heldTime = Duration.between(acquiredAt, Instant.now());
@@ -246,14 +232,14 @@ final class HazelcastReservation implements Reservation {
             }
             acquiredAt = null;
 
-            log.debug("Unlocked reservation: {}", reservationKey);
+            log.debug("Unlocked reservation: {}", identifier);
 
         } catch (IllegalMonitorStateException e) {
             // Lock expired or not owned by this thread
             metrics.recordExpiration(domain);
             acquiredAt = null;
 
-            log.warn("Unlock failed for reservation {} - likely expired", reservationKey);
+            log.warn("Unlock failed for reservation {} - likely expired", identifier);
 
             throw new ReservationExpiredException(domain, identifier);
         }

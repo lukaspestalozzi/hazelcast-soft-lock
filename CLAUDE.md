@@ -4,6 +4,23 @@
 
 Distributed soft-lock library implementing `java.util.concurrent.locks.Lock` with automatic lease expiration. Supports two backends: **Hazelcast** (using IMap.lock) and **Oracle/JDBC** (using table-based locking with polling).
 
+### Key Design: Single-Domain Managers
+
+Each `ReservationManager` handles exactly **one domain**. Create separate managers for different domains:
+
+```java
+ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+    .domain("orders")  // Required
+    .leaseTime(Duration.ofMinutes(2))
+    .build();
+
+Reservation reservation = ordersManager.getReservation("order-12345");
+```
+
+**Domain isolation:**
+- Hazelcast: Each domain uses a separate IMap (`{mapPrefix}-{domain}`, e.g., `reservations-orders`)
+- Oracle: Uses composite keys in format `{domain}::{identifier}`
+
 ## Tech Stack
 
 - Java 21
@@ -102,13 +119,16 @@ Use `scripts/run-maven-with-proxy.sh` to automatically start the proxy and run M
 ## Code Conventions
 
 - Exceptions: Use checked exceptions (`ReservationException` hierarchy)
-- Key format: `{domain}::{identifier}` (delimiter configurable)
+- Domain: Required on manager builder (throws `IllegalStateException` if not set)
+- Key format: Hazelcast uses identifier only (domain isolation via separate maps); Oracle uses `{domain}::{identifier}`
 - Thread safety: Implementations must be thread-safe; use ThreadLocal for ownership tracking
 - Reentrancy: Both backends support reentrant locking
 
 ## Testing Notes
 
-- `AbstractReservationManagerTest` contains 24+ shared tests for both backends
+- `AbstractReservationManagerTest` contains 20+ shared tests for both backends
+- `createManager(String domain, Duration leaseTime)` - tests must specify domain
+- Domain isolation tests verify locks with same identifier in different domains are independent
 - Hazelcast tests use embedded instance (no external dependencies)
 - JDBC tests use H2 in-memory database
 - Integration tests (with Testcontainers) require `-Pintegration-tests` profile

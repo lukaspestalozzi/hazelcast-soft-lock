@@ -9,7 +9,7 @@ A distributed soft-lock library for Java implementing `java.util.concurrent.lock
 - **Two backends** - Hazelcast (IMap.lock) and Oracle DB (table-based with polling)
 - **Reentrant locking** - Same thread can acquire the same lock multiple times
 - **Micrometer metrics** - Built-in observability support
-- **Domain + Identifier keys** - Logical grouping (e.g., `orders::12345`)
+- **Domain isolation** - Each manager handles one domain (e.g., "orders", "users")
 
 ## Installation
 
@@ -27,12 +27,15 @@ A distributed soft-lock library for Java implementing `java.util.concurrent.lock
 
 ```java
 HazelcastInstance hz = HazelcastClient.newHazelcastClient();
-ReservationManager manager = ReservationManager.hazelcast(hz)
+
+// Create a manager for the "orders" domain
+ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+    .domain("orders")
     .leaseTime(Duration.ofMinutes(2))
-    .mapName("my-reservations")
     .build();
 
-Reservation reservation = manager.getReservation("orders", "order-12345");
+// Get reservation by identifier only - domain comes from manager
+Reservation reservation = ordersManager.getReservation("order-12345");
 reservation.lock();
 try {
     // Critical section - only one process can execute this
@@ -46,12 +49,14 @@ try {
 
 ```java
 DataSource dataSource = getDataSource(); // Your connection pool
-ReservationManager manager = ReservationManager.oracle(dataSource)
+
+ReservationManager ordersManager = ReservationManager.oracle(dataSource)
+    .domain("orders")
     .leaseTime(Duration.ofMinutes(2))
     .tableName("RESERVATION_LOCKS")
     .build();
 
-Reservation reservation = manager.getReservation("orders", "order-12345");
+Reservation reservation = ordersManager.getReservation("order-12345");
 reservation.lock();
 try {
     processOrder("order-12345");
@@ -60,10 +65,27 @@ try {
 }
 ```
 
+### Multiple Domains
+
+```java
+// Create separate managers for different domains
+ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+    .domain("orders")
+    .build();
+
+ReservationManager usersManager = ReservationManager.hazelcast(hz)
+    .domain("users")
+    .build();
+
+// Each uses its own isolated Hazelcast map
+ordersManager.getReservation("123").lock();  // Uses map "reservations-orders"
+usersManager.getReservation("123").lock();   // Uses map "reservations-users"
+```
+
 ### Try-Lock Pattern
 
 ```java
-Reservation reservation = manager.getReservation("inventory", "sku-ABC123");
+Reservation reservation = inventoryManager.getReservation("sku-ABC123");
 if (reservation.tryLock(5, TimeUnit.SECONDS)) {
     try {
         updateInventory("sku-ABC123");
@@ -97,15 +119,15 @@ try {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `domain` | `String` | **required** | Domain for this manager |
 | `leaseTime` | `Duration` | 1 minute | Auto-release time |
-| `delimiter` | `String` | `::` | Key separator |
 | `meterRegistry` | `MeterRegistry` | null | Micrometer metrics |
 
 ### Hazelcast-Specific
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `mapName` | `String` | `reservations` | IMap name |
+| `mapPrefix` | `String` | `reservations` | Prefix for IMap name (actual name: `{prefix}-{domain}`) |
 
 ### Oracle-Specific
 
@@ -178,6 +200,7 @@ When a `MeterRegistry` is provided, the following metrics are recorded:
 MeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
 
 ReservationManager manager = ReservationManager.hazelcast(hz)
+    .domain("orders")
     .meterRegistry(registry)
     .build();
 ```
@@ -188,7 +211,8 @@ ReservationManager manager = ReservationManager.hazelcast(hz)
 |-----------|-------------|----------|
 | `ReservationAcquisitionException` | Lock cannot be acquired (infrastructure issue) | Retry or fail operation |
 | `ReservationExpiredException` | Lease expired before unlock | Log warning, handle inconsistency |
-| `InvalidReservationKeyException` | Invalid domain/identifier | Fix key validation |
+| `InvalidReservationKeyException` | Invalid identifier | Fix key validation |
+| `IllegalStateException` | Building without required domain | Set domain on builder |
 | `IllegalMonitorStateException` | Unlock without holding lock | Programming error |
 | `UnsupportedOperationException` | `newCondition()` called | Not supported for distributed locks |
 
@@ -212,6 +236,7 @@ public class MyCustomStrategy implements LockingStrategy {
 }
 
 ReservationManager manager = ReservationManager.oracle(dataSource)
+    .domain("orders")
     .lockingStrategy(new MyCustomStrategy())
     .build();
 ```
@@ -231,6 +256,7 @@ ReservationManager manager = ReservationManager.oracle(dataSource)
 - `ReservationManager` implementations are thread-safe and immutable after construction
 - `Reservation` instances are thread-safe but ownership is per-thread
 - Reentrant locking is supported (same thread can lock multiple times)
+- Each domain uses separate Hazelcast IMap for isolation
 
 ## Build & Test
 

@@ -6,11 +6,13 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.*;
 
-import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for the JDBC/Oracle-backed ReservationManager implementation.
@@ -53,8 +55,9 @@ class JdbcReservationManagerTest extends AbstractReservationManagerTest {
     }
 
     @Override
-    protected ReservationManager createManager(Duration leaseTime) {
+    protected ReservationManager createManager(String domain, Duration leaseTime) {
         return ReservationManager.oracle(dataSource)
+            .domain(domain)
             .leaseTime(leaseTime)
             .tableName(TABLE_NAME)
             .build();
@@ -75,16 +78,16 @@ class JdbcReservationManagerTest extends AbstractReservationManagerTest {
 
     @Test
     void shouldStoreHolderInfoInTable() throws Exception {
-        var reservation = manager.getReservation("orders", "holder-test");
+        var reservation = manager.getReservation("holder-test");
         reservation.lock();
 
         try {
             try (Connection conn = dataSource.getConnection();
                  Statement stmt = conn.createStatement();
                  var rs = stmt.executeQuery("SELECT holder FROM RESERVATION_LOCKS WHERE reservation_key = 'orders::holder-test'")) {
-                org.assertj.core.api.Assertions.assertThat(rs.next()).isTrue();
+                assertThat(rs.next()).isTrue();
                 String holder = rs.getString("holder");
-                org.assertj.core.api.Assertions.assertThat(holder).contains("@");
+                assertThat(holder).contains("@");
             }
         } finally {
             reservation.unlock();
@@ -94,7 +97,7 @@ class JdbcReservationManagerTest extends AbstractReservationManagerTest {
     @Test
     void shouldReturnCorrectTableName() {
         OracleReservationManager oracleManager = (OracleReservationManager) manager;
-        org.assertj.core.api.Assertions.assertThat(oracleManager.getTableName()).isEqualTo(TABLE_NAME);
+        assertThat(oracleManager.getTableName()).isEqualTo(TABLE_NAME);
     }
 
     @Test
@@ -109,8 +112,44 @@ class JdbcReservationManagerTest extends AbstractReservationManagerTest {
         }
 
         // Trying to acquire should succeed because the old lock is expired
-        var reservation = manager.getReservation("orders", "expired");
-        org.assertj.core.api.Assertions.assertThat(reservation.tryLock()).isTrue();
+        var reservation = manager.getReservation("expired");
+        assertThat(reservation.tryLock()).isTrue();
         reservation.unlock();
+    }
+
+    @Test
+    void shouldIsolateBetweenDomains() throws Exception {
+        ReservationManager manager1 = ReservationManager.oracle(dataSource)
+            .domain("domain1")
+            .tableName(TABLE_NAME)
+            .build();
+        ReservationManager manager2 = ReservationManager.oracle(dataSource)
+            .domain("domain2")
+            .tableName(TABLE_NAME)
+            .build();
+
+        try {
+            // Lock same identifier in domain1
+            var res1 = manager1.getReservation("shared-id");
+            res1.lock();
+
+            // Should be able to lock same identifier in domain2 (different composite key)
+            var res2 = manager2.getReservation("shared-id");
+            assertThat(res2.tryLock()).isTrue();
+            res2.unlock();
+
+            res1.unlock();
+        } finally {
+            manager1.close();
+            manager2.close();
+        }
+    }
+
+    @Test
+    void builderShouldRequireDomain() {
+        assertThatThrownBy(() ->
+            ReservationManager.oracle(dataSource).build()
+        ).isInstanceOf(IllegalStateException.class)
+         .hasMessageContaining("domain");
     }
 }

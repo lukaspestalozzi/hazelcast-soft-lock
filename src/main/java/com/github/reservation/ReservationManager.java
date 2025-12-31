@@ -9,19 +9,21 @@ import java.io.Closeable;
 import java.time.Duration;
 
 /**
- * Factory and manager for {@link Reservation} instances.
+ * Factory and manager for {@link Reservation} instances within a single domain.
  *
- * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle) and
- * configuration. Multiple managers can coexist, each with their own settings.</p>
+ * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle), a single
+ * domain, and configuration. Each manager handles reservations for one domain only.
+ * For multiple domains, create multiple managers.</p>
  *
  * <p>Example usage with Hazelcast:</p>
  * <pre>{@code
  * HazelcastInstance hz = HazelcastClient.newHazelcastClient();
- * ReservationManager manager = ReservationManager.hazelcast(hz)
+ * ReservationManager ordersManager = ReservationManager.hazelcast(hz)
+ *     .domain("orders")
  *     .leaseTime(Duration.ofMinutes(1))
  *     .build();
  *
- * Reservation reservation = manager.getReservation("orders", "12345");
+ * Reservation reservation = ordersManager.getReservation("12345");
  * reservation.lock();
  * try {
  *     // critical section
@@ -34,6 +36,7 @@ import java.time.Duration;
  * <pre>{@code
  * DataSource dataSource = ...;
  * ReservationManager manager = ReservationManager.oracle(dataSource)
+ *     .domain("orders")
  *     .leaseTime(Duration.ofMinutes(1))
  *     .build();
  * }</pre>
@@ -63,18 +66,23 @@ public interface ReservationManager extends Closeable {
     }
 
     /**
-     * Obtains a reservation for the given domain and identifier.
+     * Obtains a reservation for the given identifier within this manager's domain.
      *
      * <p>This method always returns a new Reservation instance, but the underlying
-     * distributed lock is shared across all instances with the same domain/identifier.</p>
+     * distributed lock is shared across all instances with the same identifier.</p>
      *
-     * @param domain the reservation domain (e.g., "orders", "users", "inventory")
      * @param identifier the identifier within the domain (e.g., order ID, user ID)
-     * @return a Reservation instance for the given domain and identifier
-     * @throws InvalidReservationKeyException if domain or identifier is null, empty,
-     *         or contains the configured delimiter
+     * @return a Reservation instance for the given identifier
+     * @throws InvalidReservationKeyException if identifier is null or empty
      */
-    Reservation getReservation(String domain, String identifier);
+    Reservation getReservation(String identifier);
+
+    /**
+     * Returns the domain managed by this ReservationManager.
+     *
+     * @return the domain string, never null
+     */
+    String getDomain();
 
     /**
      * Returns the configured lease time for reservations created by this manager.
@@ -82,13 +90,6 @@ public interface ReservationManager extends Closeable {
      * @return the lease time duration
      */
     Duration getLeaseTime();
-
-    /**
-     * Returns the configured delimiter used for composite keys.
-     *
-     * @return the delimiter string
-     */
-    String getDelimiter();
 
     /**
      * Closes this manager and releases associated resources.

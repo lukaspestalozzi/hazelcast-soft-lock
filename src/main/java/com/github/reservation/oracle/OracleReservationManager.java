@@ -1,8 +1,8 @@
 package com.github.reservation.oracle;
 
+import com.github.reservation.InvalidReservationKeyException;
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationManager;
-import com.github.reservation.internal.ReservationKeyBuilder;
 import com.github.reservation.internal.ReservationMetrics;
 import io.micrometer.core.instrument.MeterRegistry;
 
@@ -11,36 +11,40 @@ import java.time.Duration;
 
 /**
  * Oracle/JDBC-backed implementation of {@link ReservationManager}.
+ *
+ * <p>Each manager handles a single domain.</p>
  */
 public final class OracleReservationManager implements ReservationManager {
 
     private final DataSource dataSource;
     private final LockingStrategy lockingStrategy;
+    private final String domain;
     private final Duration leaseTime;
-    private final String delimiter;
     private final String tableName;
-    private final ReservationKeyBuilder keyBuilder;
     private final ReservationMetrics metrics;
 
     OracleReservationManager(
             DataSource dataSource,
             LockingStrategy lockingStrategy,
+            String domain,
             Duration leaseTime,
-            String delimiter,
             String tableName,
             MeterRegistry meterRegistry) {
         this.dataSource = dataSource;
         this.lockingStrategy = lockingStrategy;
+        this.domain = domain;
         this.leaseTime = leaseTime;
-        this.delimiter = delimiter;
         this.tableName = tableName;
-        this.keyBuilder = new ReservationKeyBuilder(delimiter);
         this.metrics = new ReservationMetrics(meterRegistry, "oracle");
     }
 
     @Override
-    public Reservation getReservation(String domain, String identifier) {
-        String reservationKey = keyBuilder.buildKey(domain, identifier);
+    public Reservation getReservation(String identifier) {
+        if (identifier == null || identifier.isEmpty()) {
+            throw new InvalidReservationKeyException("identifier must not be null or empty");
+        }
+        // Build key as domain::identifier for database storage
+        String reservationKey = domain + "::" + identifier;
         return new OracleReservation(
             lockingStrategy,
             domain,
@@ -52,13 +56,13 @@ public final class OracleReservationManager implements ReservationManager {
     }
 
     @Override
-    public Duration getLeaseTime() {
-        return leaseTime;
+    public String getDomain() {
+        return domain;
     }
 
     @Override
-    public String getDelimiter() {
-        return delimiter;
+    public Duration getLeaseTime() {
+        return leaseTime;
     }
 
     /**
