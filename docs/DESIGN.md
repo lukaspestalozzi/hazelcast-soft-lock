@@ -1,4 +1,4 @@
-# Hazelcast Soft-Lock Library - Design Document
+# Reservation Lock Library - Design Document
 
 > **Version**: 1.0.0-SNAPSHOT
 > **Status**: Draft
@@ -11,15 +11,16 @@
 1. [Overview](#1-overview)
 2. [Architecture](#2-architecture)
 3. [API Design](#3-api-design)
-4. [Implementation Details](#4-implementation-details)
-5. [Configuration](#5-configuration)
-6. [Error Handling](#6-error-handling)
-7. [Observability](#7-observability)
-8. [Testing Strategy](#8-testing-strategy)
-9. [Performance Considerations](#9-performance-considerations)
-10. [Project Structure](#10-project-structure)
-11. [Dependencies](#11-dependencies)
-12. [Roadmap](#12-roadmap)
+4. [Hazelcast Implementation](#4-hazelcast-implementation)
+5. [Oracle Implementation](#5-oracle-implementation)
+6. [Configuration](#6-configuration)
+7. [Error Handling](#7-error-handling)
+8. [Observability](#8-observability)
+9. [Testing Strategy](#9-testing-strategy)
+10. [Performance Considerations](#10-performance-considerations)
+11. [Project Structure](#11-project-structure)
+12. [Dependencies](#12-dependencies)
+13. [Roadmap](#13-roadmap)
 
 ---
 
@@ -27,30 +28,41 @@
 
 ### 1.1 Purpose
 
-This library provides a **soft-lock** implementation for distributed Java applications using Hazelcast as the synchronization medium. A soft-lock is a distributed lock that **automatically expires** after a configurable lease time (default: 1 minute), preventing deadlocks caused by crashed processes or forgotten unlocks.
+This library provides a **Reservation** (soft-lock) implementation for distributed Java applications. A reservation is a distributed lock that **automatically expires** after a configurable lease time (default: 1 minute), preventing deadlocks caused by crashed processes or forgotten unlocks.
+
+The library supports **two backend implementations**:
+- **Hazelcast**: Using `IMap.lock()` with native lease time support
+- **Oracle Database**: Using a custom lock table with TTL-based expiration
+
+Both implementations share the same API and behavioral guarantees.
 
 ### 1.2 Key Features
 
 - Implements `java.util.concurrent.locks.Lock` interface for familiarity
 - Automatic lock expiration via configurable lease time
 - Lock identity composed of **domain** and **identifier** (both Strings)
-- Built on Hazelcast `IMap.lock()` with native lease time support
+- Two interchangeable backends: Hazelcast and Oracle DB
 - Micrometer metrics integration for observability
 - Checked exceptions for explicit error handling
+- Shared test suite validating both implementations
 
 ### 1.3 Design Decisions Summary
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Hazelcast mechanism | `IMap.lock()` with lease time | Native lease support, simple setup, good performance |
-| Lock interface | `SoftLock extends Lock` | Compatibility + additional soft-lock methods |
+| Naming | `Reservation` (not SoftLock) | Domain-appropriate terminology |
+| Lock interface | `Reservation extends Lock` | Compatibility + additional methods |
 | `newCondition()` | `UnsupportedOperationException` | Not feasible for distributed locks |
 | Key format | Delimiter-based (`domain::identifier`) | Simple, readable, debuggable |
-| IMap value | None (lock without entry) | Zero storage overhead |
 | Lease time config | Global default on manager | Simplicity with configurability |
-| Thread affinity | Strict (Hazelcast native) | Consistency with Lock contract |
+| Thread affinity | Strict (per-thread ownership) | Consistency with Lock contract |
 | Error handling | Checked exceptions | Explicit failure handling |
-| Hazelcast mode | Client only | Production deployment pattern |
+| Project structure | Single module | Simpler build, single artifact |
+| Testing | Abstract base test class | Shared tests for both implementations |
+| Hazelcast value | String with debug info | Debuggability with low overhead |
+| Oracle mechanism | Custom table (pluggable strategy) | Flexibility for experimentation |
+| Oracle connection | DataSource injection | Standard enterprise pattern |
+| Oracle schema | User-managed | Enterprise DBA control |
 
 ---
 
@@ -59,86 +71,90 @@ This library provides a **soft-lock** implementation for distributed Java applic
 ### 2.1 High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Application Code                            │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     SoftLockManager                              │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐  │
-│  │ Configuration   │  │ Lock Factory    │  │ Metrics        │  │
-│  │ - leaseTime     │  │ - getLock()     │  │ - Micrometer   │  │
-│  │ - delimiter     │  │ - key building  │  │   integration  │  │
-│  │ - mapName       │  │                 │  │                │  │
-│  └─────────────────┘  └─────────────────┘  └────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        SoftLock                                  │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ Implements: java.util.concurrent.locks.Lock             │    │
-│  │ Additional: domain, identifier, remainingLeaseTime,     │    │
-│  │             forceUnlock                                 │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Hazelcast Client                               │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ IMap<String, Void>                                      │    │
-│  │ - lock(key, leaseTime, TimeUnit)                        │    │
-│  │ - tryLock(key, waitTime, TimeUnit, leaseTime, TimeUnit) │    │
-│  │ - unlock(key)                                           │    │
-│  │ - forceUnlock(key)                                      │    │
-│  │ - isLocked(key)                                         │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Hazelcast Cluster                              │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Application Code                               │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          ReservationManager                              │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────────┐ │
+│  │ Configuration    │  │ Reservation      │  │ Metrics               │ │
+│  │ - leaseTime      │  │ Factory          │  │ - Micrometer          │ │
+│  │ - delimiter      │  │ - getReservation │  │   integration         │ │
+│  └──────────────────┘  └──────────────────┘  └───────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                             Reservation                                  │
+│         Implements: java.util.concurrent.locks.Lock                      │
+│         Additional: domain, identifier, remainingLeaseTime, forceUnlock  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+┌───────────────────────────────┐   ┌───────────────────────────────────┐
+│   HazelcastReservationManager │   │     OracleReservationManager      │
+│   ┌─────────────────────────┐ │   │   ┌─────────────────────────────┐ │
+│   │ IMap<String, String>    │ │   │   │ LockingStrategy (pluggable) │ │
+│   │ - lock(key, lease)      │ │   │   │ - TableBasedLockingStrategy │ │
+│   │ - tryLock(...)          │ │   │   │ - (future strategies)       │ │
+│   │ - unlock(key)           │ │   │   └─────────────────────────────┘ │
+│   │ - value: debug string   │ │   │   ┌─────────────────────────────┐ │
+│   └─────────────────────────┘ │   │   │ DataSource                  │ │
+└───────────────────────────────┘   │   │ - connection per operation  │ │
+              │                     │   └─────────────────────────────┘ │
+              ▼                     └───────────────────────────────────┘
+┌───────────────────────────────┐                   │
+│     Hazelcast Cluster         │                   ▼
+└───────────────────────────────┘   ┌───────────────────────────────────┐
+                                    │        Oracle Database            │
+                                    │   ┌─────────────────────────────┐ │
+                                    │   │ RESERVATION_LOCKS table     │ │
+                                    │   │ (user-managed schema)       │ │
+                                    │   └─────────────────────────────┘ │
+                                    └───────────────────────────────────┘
 ```
 
 ### 2.2 Component Responsibilities
 
 | Component | Responsibility |
 |-----------|----------------|
-| `SoftLockManager` | Factory for creating locks, holds configuration and Hazelcast reference |
-| `SoftLock` | Individual lock instance, implements Lock interface |
-| `SoftLockConfig` | Immutable configuration (lease time, delimiter, map name) |
-| `LockKey` | Internal helper for building composite keys |
-| `SoftLockMetrics` | Micrometer metrics registration and recording |
+| `ReservationManager` | Interface for creating reservations, holds configuration |
+| `Reservation` | Interface for individual lock instance, extends Lock |
+| `HazelcastReservationManager` | Hazelcast-backed implementation |
+| `OracleReservationManager` | Oracle-backed implementation |
+| `LockingStrategy` | Pluggable Oracle locking mechanism (Strategy pattern) |
+| `ReservationKeyBuilder` | Internal helper for building composite keys |
+| `ReservationMetrics` | Micrometer metrics registration and recording |
 
-### 2.3 Lock Lifecycle
+### 2.3 Reservation Lifecycle
 
 ```
-┌──────────┐    getLock()    ┌──────────┐
-│  START   │────────────────▶│ CREATED  │
-└──────────┘                 └──────────┘
-                                   │
-                    lock() / tryLock()
-                                   ▼
-                             ┌──────────┐
-              ┌──────────────│ ACQUIRED │◀─────────────┐
-              │              └──────────┘              │
-              │                    │                   │
-         unlock()            lease expires       reentrant
-              │                    │              lock()
-              ▼                    ▼                   │
-         ┌──────────┐        ┌──────────┐             │
-         │ RELEASED │        │ EXPIRED  │─────────────┘
-         └──────────┘        └──────────┘
-                                   │
-                             unlock() after expiry
-                                   ▼
-                          ┌────────────────┐
-                          │ IllegalMonitor │
-                          │ StateException │
-                          └────────────────┘
+┌──────────┐  getReservation()  ┌──────────┐
+│  START   │───────────────────▶│ CREATED  │
+└──────────┘                    └──────────┘
+                                      │
+                       lock() / tryLock()
+                                      ▼
+                                ┌──────────┐
+                 ┌──────────────│ ACQUIRED │◀─────────────┐
+                 │              └──────────┘              │
+                 │                    │                   │
+            unlock()            lease expires       reentrant
+                 │                    │              lock()
+                 ▼                    ▼                   │
+            ┌──────────┐        ┌──────────┐             │
+            │ RELEASED │        │ EXPIRED  │─────────────┘
+            └──────────┘        └──────────┘
+                                      │
+                                unlock() after expiry
+                                      ▼
+                             ┌─────────────────┐
+                             │ LockExpired     │
+                             │ Exception       │
+                             └─────────────────┘
 ```
 
 ---
@@ -147,10 +163,10 @@ This library provides a **soft-lock** implementation for distributed Java applic
 
 ### 3.1 Core Interfaces
 
-#### 3.1.1 SoftLock Interface
+#### 3.1.1 Reservation Interface
 
 ```java
-package com.github.softlock;
+package com.github.reservation;
 
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
@@ -158,194 +174,214 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 
 /**
- * A distributed soft-lock that automatically expires after a configured lease time.
+ * A distributed reservation (soft-lock) that automatically expires after a configured lease time.
  *
- * <p>This lock is identified by a domain and identifier combination, allowing
+ * <p>This reservation is identified by a domain and identifier combination, allowing
  * logical grouping of locks (e.g., domain="orders", identifier="12345").</p>
  *
  * <p><b>Important:</b> The {@link #newCondition()} method is not supported for
  * distributed locks and will throw {@link UnsupportedOperationException}.</p>
  *
- * <p><b>Warning:</b> If the lease time expires while the lock is held, calling
- * {@link #unlock()} will throw {@link LockExpiredException}. This indicates that
+ * <p><b>Warning:</b> If the lease time expires while the reservation is held, calling
+ * {@link #unlock()} will throw {@link ReservationExpiredException}. This indicates that
  * the critical section guarantee may have been violated.</p>
  */
-public interface SoftLock extends Lock {
+public interface Reservation extends Lock {
 
     /**
-     * Returns the domain of this lock.
+     * Returns the domain of this reservation.
      *
      * @return the domain string, never null
      */
     String getDomain();
 
     /**
-     * Returns the identifier of this lock within its domain.
+     * Returns the identifier of this reservation within its domain.
      *
      * @return the identifier string, never null
      */
     String getIdentifier();
 
     /**
-     * Returns the composite key used for this lock.
+     * Returns the composite key used for this reservation.
      * Format: "{domain}{delimiter}{identifier}"
      *
      * @return the composite key string, never null
      */
-    String getLockKey();
+    String getReservationKey();
 
     /**
-     * Returns the remaining lease time for this lock.
+     * Returns the remaining lease time for this reservation.
      *
-     * @return remaining lease time, or {@link Duration#ZERO} if not locked
+     * @return remaining lease time, or {@link Duration#ZERO} if not held
      *         or lease has expired
      */
     Duration getRemainingLeaseTime();
 
     /**
-     * Checks if this lock is currently held by any thread.
+     * Checks if this reservation is currently held by any thread/process.
      *
-     * @return true if the lock is held, false otherwise
+     * @return true if the reservation is held, false otherwise
      */
     boolean isLocked();
 
     /**
-     * Checks if this lock is held by the current thread.
+     * Checks if this reservation is held by the current thread.
      *
-     * @return true if current thread holds the lock, false otherwise
+     * @return true if current thread holds the reservation, false otherwise
      */
     boolean isHeldByCurrentThread();
 
     /**
-     * Forces the release of this lock regardless of ownership.
+     * Forces the release of this reservation regardless of ownership.
      *
      * <p><b>Warning:</b> This is an administrative operation that should only
-     * be used for recovery scenarios. It will release the lock even if held
+     * be used for recovery scenarios. It will release the reservation even if held
      * by another thread or process.</p>
      */
     void forceUnlock();
 
-    // --- Lock interface methods with soft-lock semantics ---
+    // --- Lock interface methods with reservation semantics ---
 
     /**
-     * Acquires the lock, blocking until available.
-     * The lock will automatically be released after the configured lease time.
+     * Acquires the reservation, blocking until available.
+     * The reservation will automatically be released after the configured lease time.
      *
-     * @throws LockAcquisitionException if the lock cannot be acquired
+     * @throws ReservationAcquisitionException if the reservation cannot be acquired
      */
     @Override
-    void lock() throws LockAcquisitionException;
+    void lock() throws ReservationAcquisitionException;
 
     /**
-     * Acquires the lock unless the current thread is interrupted.
+     * Acquires the reservation unless the current thread is interrupted.
      *
      * @throws InterruptedException if the current thread is interrupted
-     * @throws LockAcquisitionException if the lock cannot be acquired
+     * @throws ReservationAcquisitionException if the reservation cannot be acquired
      */
     @Override
-    void lockInterruptibly() throws InterruptedException, LockAcquisitionException;
+    void lockInterruptibly() throws InterruptedException, ReservationAcquisitionException;
 
     /**
-     * Acquires the lock only if it is free at the time of invocation.
+     * Acquires the reservation only if it is free at the time of invocation.
      *
-     * @return true if the lock was acquired, false otherwise
+     * @return true if the reservation was acquired, false otherwise
      */
     @Override
     boolean tryLock();
 
     /**
-     * Acquires the lock if it becomes available within the given waiting time.
+     * Acquires the reservation if it becomes available within the given waiting time.
      *
-     * @param time the maximum time to wait for the lock
+     * @param time the maximum time to wait for the reservation
      * @param unit the time unit of the time argument
-     * @return true if the lock was acquired, false if the waiting time elapsed
+     * @return true if the reservation was acquired, false if the waiting time elapsed
      * @throws InterruptedException if the current thread is interrupted
      */
     @Override
     boolean tryLock(long time, TimeUnit unit) throws InterruptedException;
 
     /**
-     * Releases the lock.
+     * Releases the reservation.
      *
-     * @throws LockExpiredException if the lease time has expired before unlock
-     * @throws IllegalMonitorStateException if the current thread does not hold the lock
+     * @throws ReservationExpiredException if the lease time has expired before unlock
+     * @throws IllegalMonitorStateException if the current thread does not hold the reservation
      */
     @Override
-    void unlock() throws LockExpiredException;
+    void unlock() throws ReservationExpiredException;
 
     /**
-     * Not supported for distributed locks.
+     * Not supported for distributed reservations.
      *
      * @throws UnsupportedOperationException always
      */
     @Override
     default Condition newCondition() {
         throw new UnsupportedOperationException(
-            "Conditions are not supported for distributed soft-locks. " +
+            "Conditions are not supported for distributed reservations. " +
             "Consider using a distributed coordination service for complex synchronization.");
     }
 }
 ```
 
-#### 3.1.2 SoftLockManager Interface
+#### 3.1.2 ReservationManager Interface
 
 ```java
-package com.github.softlock;
+package com.github.reservation;
 
 import java.io.Closeable;
 import java.time.Duration;
 
 /**
- * Factory and manager for {@link SoftLock} instances.
+ * Factory and manager for {@link Reservation} instances.
  *
- * <p>A SoftLockManager is bound to a specific Hazelcast client instance and
+ * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle) and
  * configuration. Multiple managers can coexist, each with their own settings.</p>
  *
- * <p>Example usage:</p>
+ * <p>Example usage with Hazelcast:</p>
  * <pre>{@code
  * HazelcastInstance hz = HazelcastClient.newHazelcastClient();
- * SoftLockManager manager = SoftLockManager.builder(hz)
+ * ReservationManager manager = ReservationManager.hazelcast(hz)
  *     .leaseTime(Duration.ofMinutes(1))
  *     .build();
  *
- * SoftLock lock = manager.getLock("orders", "12345");
- * lock.lock();
+ * Reservation reservation = manager.getReservation("orders", "12345");
+ * reservation.lock();
  * try {
  *     // critical section
  * } finally {
- *     lock.unlock();
+ *     reservation.unlock();
  * }
  * }</pre>
+ *
+ * <p>Example usage with Oracle:</p>
+ * <pre>{@code
+ * DataSource dataSource = ...;
+ * ReservationManager manager = ReservationManager.oracle(dataSource)
+ *     .leaseTime(Duration.ofMinutes(1))
+ *     .build();
+ * }</pre>
  */
-public interface SoftLockManager extends Closeable {
+public interface ReservationManager extends Closeable {
 
     /**
-     * Creates a new builder for configuring a SoftLockManager.
+     * Creates a new builder for a Hazelcast-backed ReservationManager.
      *
      * @param hazelcastInstance the Hazelcast client instance to use
      * @return a new builder instance
      * @throws NullPointerException if hazelcastInstance is null
      */
-    static SoftLockManagerBuilder builder(com.hazelcast.core.HazelcastInstance hazelcastInstance) {
-        return new SoftLockManagerBuilder(hazelcastInstance);
+    static HazelcastReservationManagerBuilder hazelcast(
+            com.hazelcast.core.HazelcastInstance hazelcastInstance) {
+        return new HazelcastReservationManagerBuilder(hazelcastInstance);
     }
 
     /**
-     * Obtains a soft-lock for the given domain and identifier.
+     * Creates a new builder for an Oracle-backed ReservationManager.
      *
-     * <p>This method always returns a new SoftLock instance, but the underlying
-     * distributed lock is shared across all instances with the same domain/identifier.</p>
-     *
-     * @param domain the lock domain (e.g., "orders", "users", "inventory")
-     * @param identifier the identifier within the domain (e.g., order ID, user ID)
-     * @return a SoftLock instance for the given domain and identifier
-     * @throws IllegalArgumentException if domain or identifier is null, empty,
-     *         or contains the configured delimiter
+     * @param dataSource the DataSource to use for database connections
+     * @return a new builder instance
+     * @throws NullPointerException if dataSource is null
      */
-    SoftLock getLock(String domain, String identifier);
+    static OracleReservationManagerBuilder oracle(javax.sql.DataSource dataSource) {
+        return new OracleReservationManagerBuilder(dataSource);
+    }
 
     /**
-     * Returns the configured lease time for locks created by this manager.
+     * Obtains a reservation for the given domain and identifier.
+     *
+     * <p>This method always returns a new Reservation instance, but the underlying
+     * distributed lock is shared across all instances with the same domain/identifier.</p>
+     *
+     * @param domain the reservation domain (e.g., "orders", "users", "inventory")
+     * @param identifier the identifier within the domain (e.g., order ID, user ID)
+     * @return a Reservation instance for the given domain and identifier
+     * @throws InvalidReservationKeyException if domain or identifier is null, empty,
+     *         or contains the configured delimiter
+     */
+    Reservation getReservation(String domain, String identifier);
+
+    /**
+     * Returns the configured lease time for reservations created by this manager.
      *
      * @return the lease time duration
      */
@@ -359,17 +395,10 @@ public interface SoftLockManager extends Closeable {
     String getDelimiter();
 
     /**
-     * Returns the name of the Hazelcast IMap used for locking.
-     *
-     * @return the map name
-     */
-    String getMapName();
-
-    /**
      * Closes this manager and releases associated resources.
      *
-     * <p>Note: This does NOT close the underlying Hazelcast instance,
-     * nor does it release any currently held locks.</p>
+     * <p>Note: This does NOT close the underlying Hazelcast instance or DataSource,
+     * nor does it release any currently held reservations.</p>
      */
     @Override
     void close();
@@ -379,30 +408,31 @@ public interface SoftLockManager extends Closeable {
 ### 3.2 Exception Hierarchy
 
 ```java
-package com.github.softlock;
+package com.github.reservation;
 
 /**
- * Base exception for all soft-lock related errors.
+ * Base exception for all reservation-related errors.
  */
-public class SoftLockException extends Exception {
-    public SoftLockException(String message) { super(message); }
-    public SoftLockException(String message, Throwable cause) { super(message, cause); }
+public class ReservationException extends Exception {
+    public ReservationException(String message) { super(message); }
+    public ReservationException(String message, Throwable cause) { super(message, cause); }
 }
 
 /**
- * Thrown when a lock cannot be acquired.
+ * Thrown when a reservation cannot be acquired.
  */
-public class LockAcquisitionException extends SoftLockException {
+public class ReservationAcquisitionException extends ReservationException {
     private final String domain;
     private final String identifier;
 
-    public LockAcquisitionException(String domain, String identifier, String message) {
+    public ReservationAcquisitionException(String domain, String identifier, String message) {
         super(message);
         this.domain = domain;
         this.identifier = identifier;
     }
 
-    public LockAcquisitionException(String domain, String identifier, String message, Throwable cause) {
+    public ReservationAcquisitionException(String domain, String identifier,
+                                           String message, Throwable cause) {
         super(message, cause);
         this.domain = domain;
         this.identifier = identifier;
@@ -413,18 +443,19 @@ public class LockAcquisitionException extends SoftLockException {
 }
 
 /**
- * Thrown when attempting to unlock a lock whose lease has already expired.
+ * Thrown when attempting to unlock a reservation whose lease has already expired.
  *
  * <p>This exception indicates a potential violation of the critical section
- * guarantee - another process may have acquired the lock after expiration.</p>
+ * guarantee - another process may have acquired the reservation after expiration.</p>
  */
-public class LockExpiredException extends SoftLockException {
+public class ReservationExpiredException extends ReservationException {
     private final String domain;
     private final String identifier;
 
-    public LockExpiredException(String domain, String identifier) {
+    public ReservationExpiredException(String domain, String identifier) {
         super(String.format(
-            "Lock [%s::%s] lease expired before unlock. Critical section guarantee may be violated.",
+            "Reservation [%s::%s] lease expired before unlock. " +
+            "Critical section guarantee may be violated.",
             domain, identifier));
         this.domain = domain;
         this.identifier = identifier;
@@ -437,75 +468,99 @@ public class LockExpiredException extends SoftLockException {
 /**
  * Thrown when invalid arguments are provided (e.g., delimiter in domain/identifier).
  */
-public class InvalidLockKeyException extends IllegalArgumentException {
-    public InvalidLockKeyException(String message) { super(message); }
+public class InvalidReservationKeyException extends IllegalArgumentException {
+    public InvalidReservationKeyException(String message) { super(message); }
 }
 ```
 
-### 3.3 Builder Class
+### 3.3 Builder Classes
+
+#### 3.3.1 Base Builder (Shared Configuration)
 
 ```java
-package com.github.softlock;
+package com.github.reservation;
 
-import com.hazelcast.core.HazelcastInstance;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.Objects;
 
 /**
- * Builder for creating {@link SoftLockManager} instances.
+ * Base builder with common configuration for all ReservationManager implementations.
  */
-public final class SoftLockManagerBuilder {
+public abstract class AbstractReservationManagerBuilder<T extends AbstractReservationManagerBuilder<T>> {
 
-    private final HazelcastInstance hazelcastInstance;
-    private Duration leaseTime = Duration.ofMinutes(1);
-    private String delimiter = "::";
-    private String mapName = "soft-locks";
-    private MeterRegistry meterRegistry = null;
-
-    SoftLockManagerBuilder(HazelcastInstance hazelcastInstance) {
-        this.hazelcastInstance = Objects.requireNonNull(hazelcastInstance,
-            "hazelcastInstance must not be null");
-    }
+    protected Duration leaseTime = Duration.ofMinutes(1);
+    protected String delimiter = "::";
+    protected MeterRegistry meterRegistry = null;
 
     /**
-     * Sets the lease time for locks. Default: 1 minute.
-     *
-     * @param leaseTime the lease time duration (must be positive)
-     * @return this builder
-     * @throws IllegalArgumentException if leaseTime is null, zero, or negative
+     * Sets the lease time for reservations. Default: 1 minute.
      */
-    public SoftLockManagerBuilder leaseTime(Duration leaseTime) {
+    @SuppressWarnings("unchecked")
+    public T leaseTime(Duration leaseTime) {
         Objects.requireNonNull(leaseTime, "leaseTime must not be null");
         if (leaseTime.isZero() || leaseTime.isNegative()) {
             throw new IllegalArgumentException("leaseTime must be positive");
         }
         this.leaseTime = leaseTime;
-        return this;
+        return (T) this;
     }
 
     /**
      * Sets the delimiter for composite keys. Default: "::"
-     *
-     * @param delimiter the delimiter string (must not be null or empty)
-     * @return this builder
      */
-    public SoftLockManagerBuilder delimiter(String delimiter) {
+    @SuppressWarnings("unchecked")
+    public T delimiter(String delimiter) {
         Objects.requireNonNull(delimiter, "delimiter must not be null");
         if (delimiter.isEmpty()) {
             throw new IllegalArgumentException("delimiter must not be empty");
         }
         this.delimiter = delimiter;
-        return this;
+        return (T) this;
     }
 
     /**
-     * Sets the Hazelcast IMap name for storing locks. Default: "soft-locks"
-     *
-     * @param mapName the map name (must not be null or empty)
-     * @return this builder
+     * Sets the Micrometer registry for metrics. Default: none (metrics disabled)
      */
-    public SoftLockManagerBuilder mapName(String mapName) {
+    @SuppressWarnings("unchecked")
+    public T meterRegistry(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        return (T) this;
+    }
+
+    /**
+     * Builds the ReservationManager with the configured settings.
+     */
+    public abstract ReservationManager build();
+}
+```
+
+#### 3.3.2 Hazelcast Builder
+
+```java
+package com.github.reservation;
+
+import com.hazelcast.core.HazelcastInstance;
+import java.util.Objects;
+
+/**
+ * Builder for creating Hazelcast-backed {@link ReservationManager} instances.
+ */
+public final class HazelcastReservationManagerBuilder
+        extends AbstractReservationManagerBuilder<HazelcastReservationManagerBuilder> {
+
+    private final HazelcastInstance hazelcastInstance;
+    private String mapName = "reservations";
+
+    HazelcastReservationManagerBuilder(HazelcastInstance hazelcastInstance) {
+        this.hazelcastInstance = Objects.requireNonNull(hazelcastInstance,
+            "hazelcastInstance must not be null");
+    }
+
+    /**
+     * Sets the Hazelcast IMap name for storing reservations. Default: "reservations"
+     */
+    public HazelcastReservationManagerBuilder mapName(String mapName) {
         Objects.requireNonNull(mapName, "mapName must not be null");
         if (mapName.isEmpty()) {
             throw new IllegalArgumentException("mapName must not be empty");
@@ -514,24 +569,9 @@ public final class SoftLockManagerBuilder {
         return this;
     }
 
-    /**
-     * Sets the Micrometer registry for metrics. Default: none (metrics disabled)
-     *
-     * @param meterRegistry the meter registry, or null to disable metrics
-     * @return this builder
-     */
-    public SoftLockManagerBuilder meterRegistry(MeterRegistry meterRegistry) {
-        this.meterRegistry = meterRegistry;
-        return this;
-    }
-
-    /**
-     * Builds the SoftLockManager with the configured settings.
-     *
-     * @return a new SoftLockManager instance
-     */
-    public SoftLockManager build() {
-        return new DefaultSoftLockManager(
+    @Override
+    public ReservationManager build() {
+        return new HazelcastReservationManager(
             hazelcastInstance,
             leaseTime,
             delimiter,
@@ -542,212 +582,693 @@ public final class SoftLockManagerBuilder {
 }
 ```
 
+#### 3.3.3 Oracle Builder
+
+```java
+package com.github.reservation;
+
+import com.github.reservation.oracle.LockingStrategy;
+import com.github.reservation.oracle.TableBasedLockingStrategy;
+import javax.sql.DataSource;
+import java.util.Objects;
+
+/**
+ * Builder for creating Oracle-backed {@link ReservationManager} instances.
+ */
+public final class OracleReservationManagerBuilder
+        extends AbstractReservationManagerBuilder<OracleReservationManagerBuilder> {
+
+    private final DataSource dataSource;
+    private String tableName = "RESERVATION_LOCKS";
+    private LockingStrategy lockingStrategy = null; // null = use default
+
+    OracleReservationManagerBuilder(DataSource dataSource) {
+        this.dataSource = Objects.requireNonNull(dataSource,
+            "dataSource must not be null");
+    }
+
+    /**
+     * Sets the table name for storing reservations. Default: "RESERVATION_LOCKS"
+     *
+     * <p>Note: The table must be created by the user. See documentation for required schema.</p>
+     */
+    public OracleReservationManagerBuilder tableName(String tableName) {
+        Objects.requireNonNull(tableName, "tableName must not be null");
+        if (tableName.isEmpty()) {
+            throw new IllegalArgumentException("tableName must not be empty");
+        }
+        this.tableName = tableName;
+        return this;
+    }
+
+    /**
+     * Sets a custom locking strategy. Default: {@link TableBasedLockingStrategy}
+     *
+     * <p>This allows experimentation with different locking mechanisms.</p>
+     */
+    public OracleReservationManagerBuilder lockingStrategy(LockingStrategy lockingStrategy) {
+        this.lockingStrategy = Objects.requireNonNull(lockingStrategy,
+            "lockingStrategy must not be null");
+        return this;
+    }
+
+    @Override
+    public ReservationManager build() {
+        LockingStrategy strategy = lockingStrategy != null
+            ? lockingStrategy
+            : new TableBasedLockingStrategy(dataSource, tableName);
+
+        return new OracleReservationManager(
+            dataSource,
+            strategy,
+            leaseTime,
+            delimiter,
+            meterRegistry
+        );
+    }
+}
+```
+
 ---
 
-## 4. Implementation Details
+## 4. Hazelcast Implementation
 
-### 4.1 Lock Key Construction
+### 4.1 Overview
+
+The Hazelcast implementation uses `IMap.lock()` with native lease time support. For debuggability, it stores a value in the map when a lock is acquired.
+
+### 4.2 IMap Value Format
+
+Values are stored as simple key-value strings for debugging:
+
+```
+holder=thread-123@host-abc,acquired=2025-01-01T12:00:00.000Z
+```
+
+Implementation:
 
 ```java
 /**
- * Internal utility for building and validating lock keys.
+ * Builds the debug value stored in the IMap.
  */
-final class LockKeyBuilder {
+final class ReservationValueBuilder {
 
-    private final String delimiter;
+    static String buildValue() {
+        String threadName = Thread.currentThread().getName();
+        String hostName = getHostName();
+        Instant acquired = Instant.now();
 
-    LockKeyBuilder(String delimiter) {
-        this.delimiter = delimiter;
+        return String.format("holder=%s@%s,acquired=%s",
+            threadName, hostName, acquired.toString());
     }
 
-    String buildKey(String domain, String identifier) {
-        validate(domain, "domain");
-        validate(identifier, "identifier");
-        return domain + delimiter + identifier;
-    }
-
-    private void validate(String value, String name) {
-        if (value == null || value.isEmpty()) {
-            throw new InvalidLockKeyException(name + " must not be null or empty");
-        }
-        if (value.contains(delimiter)) {
-            throw new InvalidLockKeyException(
-                name + " must not contain the delimiter '" + delimiter + "': " + value);
+    private static String getHostName() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            return "unknown";
         }
     }
 }
 ```
 
-### 4.2 IMap Usage Pattern
-
-Since we're using `IMap.lock()` without storing values:
+### 4.3 Lock Operations
 
 ```java
-// Acquire lock with lease time
-IMap<String, Object> lockMap = hazelcastInstance.getMap(mapName);
-String lockKey = domain + "::" + identifier;
+class HazelcastReservation implements Reservation {
 
-// Blocking acquire with lease
-lockMap.lock(lockKey, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+    private final IMap<String, String> lockMap;
+    private final String reservationKey;
+    private final Duration leaseTime;
+    private final String domain;
+    private final String identifier;
 
-// Non-blocking acquire with lease
-boolean acquired = lockMap.tryLock(
-    lockKey,
-    waitTime, waitTimeUnit,           // how long to wait
-    leaseTime.toMillis(), TimeUnit.MILLISECONDS  // auto-release after
-);
+    @Override
+    public void lock() throws ReservationAcquisitionException {
+        try {
+            // First acquire the Hazelcast lock
+            lockMap.lock(reservationKey, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
-// Release
-try {
-    lockMap.unlock(lockKey);
-} catch (IllegalMonitorStateException e) {
-    // Lock expired or not held by current thread
-    throw new LockExpiredException(domain, identifier);
-}
+            // Then store debug value
+            String value = ReservationValueBuilder.buildValue();
+            lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
-// Check status
-boolean locked = lockMap.isLocked(lockKey);
-```
-
-### 4.3 Handling Lock Expiration
-
-The critical challenge: detecting when a lock has expired before `unlock()`:
-
-```java
-@Override
-public void unlock() throws LockExpiredException {
-    try {
-        lockMap.unlock(lockKey);
-        metrics.recordUnlock(domain, identifier, true);
-    } catch (IllegalMonitorStateException e) {
-        // This happens when:
-        // 1. Current thread doesn't own the lock (programming error)
-        // 2. Lease expired (soft-lock did its job, but critical section may be violated)
-        metrics.recordUnlock(domain, identifier, false);
-
-        if (wasHeldByCurrentThread()) {
-            // We held it, but lease expired
-            throw new LockExpiredException(domain, identifier);
-        } else {
-            // Programming error - didn't own the lock
-            throw e;
+        } catch (Exception e) {
+            throw new ReservationAcquisitionException(domain, identifier,
+                "Failed to acquire reservation", e);
         }
+    }
+
+    @Override
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
+        boolean acquired = lockMap.tryLock(
+            reservationKey,
+            time, unit,                                    // wait time
+            leaseTime.toMillis(), TimeUnit.MILLISECONDS    // lease time
+        );
+
+        if (acquired) {
+            String value = ReservationValueBuilder.buildValue();
+            lockMap.set(reservationKey, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+        }
+
+        return acquired;
+    }
+
+    @Override
+    public void unlock() throws ReservationExpiredException {
+        try {
+            lockMap.remove(reservationKey);  // Clean up debug value
+            lockMap.unlock(reservationKey);
+        } catch (IllegalMonitorStateException e) {
+            // Lock expired or not owned
+            throw new ReservationExpiredException(domain, identifier);
+        }
+    }
+
+    @Override
+    public void forceUnlock() {
+        lockMap.remove(reservationKey);
+        lockMap.forceUnlock(reservationKey);
     }
 }
 ```
 
 ### 4.4 Thread Safety
 
-The implementation must be thread-safe:
-
-- `SoftLockManager`: Immutable after construction, thread-safe
-- `SoftLock`: Each instance wraps a specific key; thread-safe via Hazelcast's guarantees
-- `LockKeyBuilder`: Immutable, thread-safe
+- `HazelcastReservationManager`: Immutable after construction, thread-safe
+- `HazelcastReservation`: Thread-safe via Hazelcast's guarantees
+- IMap operations are atomic
 
 ---
 
-## 5. Configuration
+## 5. Oracle Implementation
 
-### 5.1 Configuration Properties
+### 5.1 Overview
+
+The Oracle implementation uses a custom lock table with polling-based acquisition. The locking mechanism is designed as a **pluggable strategy** to allow experimentation with different approaches.
+
+### 5.2 Locking Strategy Interface
+
+```java
+package com.github.reservation.oracle;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
+
+/**
+ * Strategy interface for Oracle-based locking mechanisms.
+ *
+ * <p>This interface allows experimentation with different locking approaches
+ * without changing the rest of the implementation.</p>
+ *
+ * <p>Implementations must be thread-safe.</p>
+ */
+public interface LockingStrategy {
+
+    /**
+     * Attempts to acquire a lock.
+     *
+     * @param reservationKey the composite key (domain::identifier)
+     * @param holder unique identifier for the lock holder (thread@host)
+     * @param leaseTime how long the lock should be held before auto-expiry
+     * @return true if lock was acquired, false if already held by another
+     * @throws LockingException if a database error occurs
+     */
+    boolean tryAcquire(String reservationKey, String holder, Duration leaseTime)
+        throws LockingException;
+
+    /**
+     * Releases a lock.
+     *
+     * @param reservationKey the composite key
+     * @param holder the holder that acquired the lock
+     * @return true if lock was released, false if not held or expired
+     * @throws LockingException if a database error occurs
+     */
+    boolean release(String reservationKey, String holder) throws LockingException;
+
+    /**
+     * Forcefully releases a lock regardless of owner.
+     *
+     * @param reservationKey the composite key
+     * @throws LockingException if a database error occurs
+     */
+    void forceRelease(String reservationKey) throws LockingException;
+
+    /**
+     * Checks if a lock is currently held (and not expired).
+     *
+     * @param reservationKey the composite key
+     * @return true if lock is held, false otherwise
+     * @throws LockingException if a database error occurs
+     */
+    boolean isLocked(String reservationKey) throws LockingException;
+
+    /**
+     * Gets lock information if held.
+     *
+     * @param reservationKey the composite key
+     * @return lock info if held, empty if not
+     * @throws LockingException if a database error occurs
+     */
+    Optional<LockInfo> getLockInfo(String reservationKey) throws LockingException;
+
+    /**
+     * Information about a held lock.
+     */
+    record LockInfo(
+        String holder,
+        Instant acquiredAt,
+        Instant expiresAt
+    ) {
+        public Duration remainingLeaseTime() {
+            Duration remaining = Duration.between(Instant.now(), expiresAt);
+            return remaining.isNegative() ? Duration.ZERO : remaining;
+        }
+    }
+}
+```
+
+### 5.3 Table-Based Locking Strategy
+
+```java
+package com.github.reservation.oracle;
+
+import javax.sql.DataSource;
+import java.sql.*;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
+
+/**
+ * Default locking strategy using a custom table with TTL-based expiration.
+ *
+ * <p>This strategy uses optimistic locking: successful INSERT = lock acquired,
+ * constraint violation = lock already held.</p>
+ *
+ * <p>Expired locks are cleaned up lazily on acquisition attempts.</p>
+ */
+public class TableBasedLockingStrategy implements LockingStrategy {
+
+    private final DataSource dataSource;
+    private final String tableName;
+
+    // SQL statements (initialized in constructor based on tableName)
+    private final String INSERT_SQL;
+    private final String DELETE_SQL;
+    private final String DELETE_FORCE_SQL;
+    private final String SELECT_SQL;
+    private final String CLEANUP_EXPIRED_SQL;
+
+    public TableBasedLockingStrategy(DataSource dataSource, String tableName) {
+        this.dataSource = dataSource;
+        this.tableName = tableName;
+
+        // Initialize SQL with table name
+        INSERT_SQL = String.format(
+            "INSERT INTO %s (reservation_key, holder, acquired_at, expires_at) " +
+            "VALUES (?, ?, ?, ?)", tableName);
+        DELETE_SQL = String.format(
+            "DELETE FROM %s WHERE reservation_key = ? AND holder = ?", tableName);
+        DELETE_FORCE_SQL = String.format(
+            "DELETE FROM %s WHERE reservation_key = ?", tableName);
+        SELECT_SQL = String.format(
+            "SELECT holder, acquired_at, expires_at FROM %s " +
+            "WHERE reservation_key = ? AND expires_at > SYSTIMESTAMP", tableName);
+        CLEANUP_EXPIRED_SQL = String.format(
+            "DELETE FROM %s WHERE reservation_key = ? AND expires_at <= SYSTIMESTAMP", tableName);
+    }
+
+    @Override
+    public boolean tryAcquire(String reservationKey, String holder, Duration leaseTime)
+            throws LockingException {
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                // First, clean up any expired lock for this key
+                cleanupExpired(conn, reservationKey);
+
+                // Try to insert new lock
+                Instant now = Instant.now();
+                Instant expiresAt = now.plus(leaseTime);
+
+                try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
+                    ps.setString(1, reservationKey);
+                    ps.setString(2, holder);
+                    ps.setTimestamp(3, Timestamp.from(now));
+                    ps.setTimestamp(4, Timestamp.from(expiresAt));
+                    ps.executeUpdate();
+                }
+
+                conn.commit();
+                return true;
+
+            } catch (SQLIntegrityConstraintViolationException e) {
+                // Lock already held by another (unique constraint violation)
+                conn.rollback();
+                return false;
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw new LockingException("Failed to acquire lock: " + reservationKey, e);
+        }
+    }
+
+    @Override
+    public boolean release(String reservationKey, String holder) throws LockingException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(DELETE_SQL)) {
+            ps.setString(1, reservationKey);
+            ps.setString(2, holder);
+            int deleted = ps.executeUpdate();
+            return deleted > 0;
+        } catch (SQLException e) {
+            throw new LockingException("Failed to release lock: " + reservationKey, e);
+        }
+    }
+
+    @Override
+    public void forceRelease(String reservationKey) throws LockingException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(DELETE_FORCE_SQL)) {
+            ps.setString(1, reservationKey);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new LockingException("Failed to force release lock: " + reservationKey, e);
+        }
+    }
+
+    @Override
+    public boolean isLocked(String reservationKey) throws LockingException {
+        return getLockInfo(reservationKey).isPresent();
+    }
+
+    @Override
+    public Optional<LockInfo> getLockInfo(String reservationKey) throws LockingException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(SELECT_SQL)) {
+            ps.setString(1, reservationKey);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.of(new LockInfo(
+                        rs.getString("holder"),
+                        rs.getTimestamp("acquired_at").toInstant(),
+                        rs.getTimestamp("expires_at").toInstant()
+                    ));
+                }
+                return Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new LockingException("Failed to get lock info: " + reservationKey, e);
+        }
+    }
+
+    private void cleanupExpired(Connection conn, String reservationKey) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(CLEANUP_EXPIRED_SQL)) {
+            ps.setString(1, reservationKey);
+            ps.executeUpdate();
+        }
+    }
+}
+```
+
+### 5.4 Required Database Schema
+
+The user must create the following table (library documents this, does not auto-create):
+
+```sql
+-- Required schema for reservation locks
+-- Create this table before using the Oracle ReservationManager
+
+CREATE TABLE RESERVATION_LOCKS (
+    reservation_key  VARCHAR2(512)  NOT NULL,
+    holder           VARCHAR2(256)  NOT NULL,
+    acquired_at      TIMESTAMP      NOT NULL,
+    expires_at       TIMESTAMP      NOT NULL,
+
+    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
+);
+
+-- Index for cleanup queries
+CREATE INDEX idx_reservation_locks_expires ON RESERVATION_LOCKS (expires_at);
+
+-- Optional: Add comments
+COMMENT ON TABLE RESERVATION_LOCKS IS 'Distributed reservation locks with automatic expiration';
+COMMENT ON COLUMN RESERVATION_LOCKS.reservation_key IS 'Composite key: domain::identifier';
+COMMENT ON COLUMN RESERVATION_LOCKS.holder IS 'Lock owner: thread@host';
+COMMENT ON COLUMN RESERVATION_LOCKS.acquired_at IS 'When the lock was acquired';
+COMMENT ON COLUMN RESERVATION_LOCKS.expires_at IS 'When the lock automatically expires';
+```
+
+### 5.5 Polling for Contended Locks
+
+When `lock()` (blocking) is called and the lock is held, the Oracle implementation polls:
+
+```java
+class OracleReservation implements Reservation {
+
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
+    private static final Duration MAX_POLL_INTERVAL = Duration.ofSeconds(2);
+
+    @Override
+    public void lock() throws ReservationAcquisitionException {
+        String holder = buildHolder();
+        Duration pollInterval = POLL_INTERVAL;
+
+        while (true) {
+            try {
+                if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
+                    this.currentHolder = holder;
+                    return;
+                }
+
+                // Exponential backoff with cap
+                Thread.sleep(pollInterval.toMillis());
+                pollInterval = pollInterval.multipliedBy(2);
+                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
+                    pollInterval = MAX_POLL_INTERVAL;
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ReservationAcquisitionException(domain, identifier,
+                    "Interrupted while waiting for reservation", e);
+            } catch (LockingException e) {
+                throw new ReservationAcquisitionException(domain, identifier,
+                    "Database error acquiring reservation", e);
+            }
+        }
+    }
+
+    @Override
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
+        String holder = buildHolder();
+        long deadline = System.nanoTime() + unit.toNanos(time);
+        Duration pollInterval = POLL_INTERVAL;
+
+        while (System.nanoTime() < deadline) {
+            try {
+                if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
+                    this.currentHolder = holder;
+                    return true;
+                }
+
+                long remainingNanos = deadline - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    return false;
+                }
+
+                long sleepMillis = Math.min(pollInterval.toMillis(),
+                                            TimeUnit.NANOSECONDS.toMillis(remainingNanos));
+                Thread.sleep(sleepMillis);
+
+                pollInterval = pollInterval.multipliedBy(2);
+                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
+                    pollInterval = MAX_POLL_INTERVAL;
+                }
+
+            } catch (LockingException e) {
+                // Log and continue trying
+            }
+        }
+        return false;
+    }
+
+    private String buildHolder() {
+        String threadName = Thread.currentThread().getName();
+        String hostName = getHostName();
+        return threadName + "@" + hostName;
+    }
+}
+```
+
+### 5.6 Alternative Strategies (Future)
+
+The `LockingStrategy` interface allows future experimentation:
+
+```java
+// Possible future strategies:
+
+/**
+ * Uses SELECT FOR UPDATE with SKIP LOCKED (Oracle 11g+).
+ * Requires holding connection during lock.
+ */
+class SelectForUpdateLockingStrategy implements LockingStrategy { }
+
+/**
+ * Uses DBMS_LOCK package for session-scoped locks.
+ * Requires EXECUTE privilege on DBMS_LOCK.
+ */
+class DbmsLockLockingStrategy implements LockingStrategy { }
+
+/**
+ * Uses Oracle AQ (Advanced Queuing) for lock coordination.
+ */
+class AqBasedLockingStrategy implements LockingStrategy { }
+```
+
+---
+
+## 6. Configuration
+
+### 6.1 Common Configuration Properties
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `leaseTime` | `Duration` | 1 minute | Time after which lock auto-releases |
+| `leaseTime` | `Duration` | 1 minute | Time after which reservation auto-releases |
 | `delimiter` | `String` | `::` | Separator between domain and identifier |
-| `mapName` | `String` | `soft-locks` | Hazelcast IMap name |
 | `meterRegistry` | `MeterRegistry` | `null` | Micrometer registry (null = no metrics) |
 
-### 5.2 Hazelcast Client Configuration
+### 6.2 Hazelcast-Specific Configuration
 
-The library expects a pre-configured `HazelcastInstance`. Example client setup:
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `mapName` | `String` | `reservations` | Hazelcast IMap name |
+
+### 6.3 Oracle-Specific Configuration
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `tableName` | `String` | `RESERVATION_LOCKS` | Database table name |
+| `lockingStrategy` | `LockingStrategy` | `TableBasedLockingStrategy` | Pluggable locking mechanism |
+
+### 6.4 Hazelcast Client Setup Example
 
 ```java
 ClientConfig config = new ClientConfig();
 config.setClusterName("my-cluster");
 config.getNetworkConfig().addAddress("hazelcast-node1:5701", "hazelcast-node2:5701");
 
-// Connection retry
 config.getConnectionStrategyConfig()
     .getConnectionRetryConfig()
     .setClusterConnectTimeoutMillis(30000);
 
 HazelcastInstance hz = HazelcastClient.newHazelcastClient(config);
+
+ReservationManager manager = ReservationManager.hazelcast(hz)
+    .leaseTime(Duration.ofMinutes(2))
+    .mapName("my-reservations")
+    .build();
+```
+
+### 6.5 Oracle DataSource Setup Example
+
+```java
+// Using HikariCP
+HikariConfig hikariConfig = new HikariConfig();
+hikariConfig.setJdbcUrl("jdbc:oracle:thin:@//dbhost:1521/ORCL");
+hikariConfig.setUsername("app_user");
+hikariConfig.setPassword("secret");
+hikariConfig.setMaximumPoolSize(10);
+
+DataSource dataSource = new HikariDataSource(hikariConfig);
+
+ReservationManager manager = ReservationManager.oracle(dataSource)
+    .leaseTime(Duration.ofMinutes(2))
+    .tableName("MY_LOCKS")
+    .build();
 ```
 
 ---
 
-## 6. Error Handling
+## 7. Error Handling
 
-### 6.1 Exception Strategy
+### 7.1 Exception Strategy
 
 All public API methods use **checked exceptions** to force explicit handling:
 
 | Method | Throws | Reason |
 |--------|--------|--------|
-| `lock()` | `LockAcquisitionException` | Network/cluster issues |
-| `lockInterruptibly()` | `InterruptedException`, `LockAcquisitionException` | Interruption, network issues |
+| `lock()` | `ReservationAcquisitionException` | Network/database issues |
+| `lockInterruptibly()` | `InterruptedException`, `ReservationAcquisitionException` | Interruption, infrastructure issues |
 | `tryLock()` | (none - returns boolean) | Non-blocking, failure = false |
 | `tryLock(time, unit)` | `InterruptedException` | Timeout = false, interruption = exception |
-| `unlock()` | `LockExpiredException` | Lease expired before unlock |
+| `unlock()` | `ReservationExpiredException` | Lease expired before unlock |
 | `newCondition()` | `UnsupportedOperationException` | Not supported |
 
-### 6.2 Recovery Scenarios
+### 7.2 Recovery Scenarios
 
-| Scenario | Behavior | Recovery |
-|----------|----------|----------|
-| Network partition during lock hold | Lock may expire; other node may acquire | `LockExpiredException` on unlock |
-| Client crash while holding lock | Hazelcast releases lock (member death) | Automatic |
-| Lease expires during critical section | Another thread may acquire lock | `LockExpiredException` warns of violation |
-| Hazelcast cluster unavailable | `LockAcquisitionException` | Retry with backoff |
+| Scenario | Hazelcast Behavior | Oracle Behavior |
+|----------|-------------------|-----------------|
+| Network partition | Lock may expire; other node may acquire | Same |
+| Client/Process crash | Hazelcast releases (member death) | Lock expires via TTL |
+| Lease expires during critical section | `ReservationExpiredException` on unlock | Same |
+| Backend unavailable | `ReservationAcquisitionException` | Same |
+| Database connection failure | N/A | `ReservationAcquisitionException` |
 
 ---
 
-## 7. Observability
+## 8. Observability
 
-### 7.1 Micrometer Metrics
+### 8.1 Micrometer Metrics
 
 | Metric Name | Type | Tags | Description |
 |-------------|------|------|-------------|
-| `softlock.acquire` | Timer | `domain`, `result` | Lock acquisition time and outcome |
-| `softlock.acquire.attempts` | Counter | `domain`, `result` | Acquisition attempts (success/failure) |
-| `softlock.held.time` | Timer | `domain` | Duration lock was held |
-| `softlock.expired` | Counter | `domain` | Locks that expired before unlock |
-| `softlock.active` | Gauge | `domain` | Currently held locks (approximate) |
+| `reservation.acquire` | Timer | `domain`, `backend`, `result` | Acquisition time and outcome |
+| `reservation.acquire.attempts` | Counter | `domain`, `backend`, `result` | Acquisition attempts |
+| `reservation.held.time` | Timer | `domain`, `backend` | Duration reservation was held |
+| `reservation.expired` | Counter | `domain`, `backend` | Reservations expired before unlock |
+| `reservation.active` | Gauge | `domain`, `backend` | Currently held reservations (approximate) |
 
-### 7.2 Metric Tags
+### 8.2 Metric Tags
 
-- `domain`: The lock domain (for grouping/filtering)
+- `domain`: The reservation domain (for grouping/filtering)
+- `backend`: `hazelcast` or `oracle`
 - `result`: `acquired`, `timeout`, `interrupted`, `error`
 
-### 7.3 Example Metrics Registration
+### 8.3 Metrics Implementation
 
 ```java
-class SoftLockMetrics {
+class ReservationMetrics {
     private final MeterRegistry registry;
-    private final Timer acquireTimer;
-    private final Counter expiredCounter;
+    private final String backend;
 
-    SoftLockMetrics(MeterRegistry registry) {
+    ReservationMetrics(MeterRegistry registry, String backend) {
         this.registry = registry;
-        this.acquireTimer = Timer.builder("softlock.acquire")
-            .description("Time to acquire soft-lock")
-            .register(registry);
-        this.expiredCounter = Counter.builder("softlock.expired")
-            .description("Locks expired before unlock")
-            .register(registry);
+        this.backend = backend;
     }
 
-    void recordAcquisition(String domain, Duration elapsed, boolean success) {
-        Timer.builder("softlock.acquire")
+    void recordAcquisition(String domain, Duration elapsed, String result) {
+        if (registry == null) return;
+
+        Timer.builder("reservation.acquire")
             .tag("domain", domain)
-            .tag("result", success ? "acquired" : "failed")
+            .tag("backend", backend)
+            .tag("result", result)
             .register(registry)
             .record(elapsed);
     }
 
     void recordExpiration(String domain) {
-        Counter.builder("softlock.expired")
+        if (registry == null) return;
+
+        Counter.builder("reservation.expired")
             .tag("domain", domain)
+            .tag("backend", backend)
             .register(registry)
             .increment();
     }
@@ -756,190 +1277,502 @@ class SoftLockMetrics {
 
 ---
 
-## 8. Testing Strategy
+## 9. Testing Strategy
 
-### 8.1 Test Pyramid
+### 9.1 Test Pyramid
 
 ```
-                    ┌─────────────────┐
-                    │   E2E Tests     │  ← Manual/staged (real cluster)
-                    │   (Few)         │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Integration    │  ← Testcontainers (Hazelcast Docker)
-                    │  Tests          │
-                    │  (Medium)       │
-                    └────────┬────────┘
-                             │
-          ┌──────────────────▼──────────────────┐
-          │           Unit Tests                 │  ← Embedded Hazelcast
-          │           (Many)                     │
-          └──────────────────────────────────────┘
+                      ┌─────────────────┐
+                      │   E2E Tests     │  ← Manual/staged (real infra)
+                      │   (Few)         │
+                      └────────┬────────┘
+                               │
+                      ┌────────▼────────┐
+                      │  Integration    │  ← Testcontainers
+                      │  Tests          │     (Hazelcast + Oracle)
+                      │  (Medium)       │
+                      └────────┬────────┘
+                               │
+          ┌────────────────────▼────────────────────┐
+          │              Unit Tests                  │  ← Embedded Hazelcast
+          │              (Many)                      │     + H2 (Oracle compat)
+          └─────────────────────────────────────────┘
 ```
 
-### 8.2 Unit Tests (Embedded Hazelcast)
+### 9.2 Shared Test Suite with Abstract Base Class
 
-Fast, isolated tests using embedded Hazelcast:
+Both implementations run the **same tests** via an abstract base class:
 
 ```java
-class SoftLockUnitTest {
+package com.github.reservation;
 
-    private static HazelcastInstance hz;
-    private SoftLockManager manager;
+import org.junit.jupiter.api.*;
+import java.time.Duration;
+import java.util.concurrent.*;
 
-    @BeforeAll
-    static void setupCluster() {
-        Config config = new Config();
-        config.setClusterName("test-" + UUID.randomUUID());
-        hz = Hazelcast.newHazelcastInstance(config);
-    }
+import static org.assertj.core.api.Assertions.*;
+
+/**
+ * Abstract base test class defining the contract for all ReservationManager implementations.
+ *
+ * <p>Subclasses provide the specific implementation to test.</p>
+ */
+abstract class AbstractReservationManagerTest {
+
+    protected ReservationManager manager;
+
+    /**
+     * Creates the ReservationManager implementation to test.
+     * Called before each test.
+     */
+    protected abstract ReservationManager createManager(Duration leaseTime);
+
+    /**
+     * Cleans up resources after each test.
+     */
+    protected abstract void cleanup();
 
     @BeforeEach
-    void setup() {
-        manager = SoftLockManager.builder(hz)
-            .leaseTime(Duration.ofSeconds(5))
-            .mapName("test-locks-" + UUID.randomUUID())
-            .build();
+    void setUp() {
+        manager = createManager(Duration.ofSeconds(5));
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (manager != null) {
+            manager.close();
+        }
+        cleanup();
+    }
+
+    // ==================== Core Lock/Unlock Tests ====================
+
+    @Test
+    void shouldAcquireAndReleaseReservation() throws Exception {
+        Reservation reservation = manager.getReservation("orders", "123");
+
+        reservation.lock();
+        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+        assertThat(reservation.isLocked()).isTrue();
+
+        reservation.unlock();
+        assertThat(reservation.isLocked()).isFalse();
     }
 
     @Test
-    void shouldAcquireAndReleaseLock() throws Exception {
-        SoftLock lock = manager.getLock("orders", "123");
+    void shouldReturnCorrectDomainAndIdentifier() {
+        Reservation reservation = manager.getReservation("orders", "456");
 
-        lock.lock();
-        assertThat(lock.isHeldByCurrentThread()).isTrue();
-
-        lock.unlock();
-        assertThat(lock.isLocked()).isFalse();
+        assertThat(reservation.getDomain()).isEqualTo("orders");
+        assertThat(reservation.getIdentifier()).isEqualTo("456");
+        assertThat(reservation.getReservationKey()).isEqualTo("orders::456");
     }
+
+    // ==================== Expiration Tests ====================
 
     @Test
     void shouldExpireAfterLeaseTime() throws Exception {
-        SoftLock lock = manager.getLock("orders", "456");
-        lock.lock();
+        // Use short lease for this test
+        ReservationManager shortLeaseManager = createManager(Duration.ofSeconds(2));
+        Reservation reservation = shortLeaseManager.getReservation("orders", "789");
+
+        reservation.lock();
+        assertThat(reservation.isLocked()).isTrue();
 
         // Wait for lease to expire
-        Thread.sleep(6000);
+        Thread.sleep(3000);
 
-        assertThat(lock.isLocked()).isFalse();
-        assertThatThrownBy(lock::unlock)
-            .isInstanceOf(LockExpiredException.class);
+        assertThat(reservation.isLocked()).isFalse();
+        assertThatThrownBy(reservation::unlock)
+            .isInstanceOf(ReservationExpiredException.class);
+
+        shortLeaseManager.close();
     }
 
     @Test
+    void shouldHavePositiveRemainingLeaseTimeAfterAcquire() throws Exception {
+        Reservation reservation = manager.getReservation("orders", "lease-test");
+        reservation.lock();
+
+        Duration remaining = reservation.getRemainingLeaseTime();
+        assertThat(remaining).isPositive();
+        assertThat(remaining).isLessThanOrEqualTo(Duration.ofSeconds(5));
+
+        reservation.unlock();
+    }
+
+    // ==================== Concurrency Tests ====================
+
+    @Test
     void shouldBlockConcurrentAcquisition() throws Exception {
-        SoftLock lock = manager.getLock("orders", "789");
-        lock.lock();
+        Reservation reservation = manager.getReservation("orders", "concurrent");
+        reservation.lock();
 
         CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
-            SoftLock sameLock = manager.getLock("orders", "789");
-            return sameLock.tryLock();
+            Reservation sameReservation = manager.getReservation("orders", "concurrent");
+            return sameReservation.tryLock();
         });
 
-        assertThat(otherThread.get()).isFalse();
-        lock.unlock();
+        assertThat(otherThread.get(1, TimeUnit.SECONDS)).isFalse();
+        reservation.unlock();
+    }
+
+    @Test
+    void shouldAllowAcquisitionAfterRelease() throws Exception {
+        Reservation reservation1 = manager.getReservation("orders", "release-test");
+        reservation1.lock();
+        reservation1.unlock();
+
+        // Different thread should now be able to acquire
+        CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
+            Reservation reservation2 = manager.getReservation("orders", "release-test");
+            boolean acquired = reservation2.tryLock();
+            if (acquired) {
+                try {
+                    reservation2.unlock();
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+            return acquired;
+        });
+
+        assertThat(otherThread.get(1, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    void shouldAllowAcquisitionAfterExpiry() throws Exception {
+        ReservationManager shortLeaseManager = createManager(Duration.ofSeconds(1));
+        Reservation reservation = shortLeaseManager.getReservation("orders", "expiry-test");
+
+        reservation.lock();
+        Thread.sleep(1500); // Wait for expiry
+
+        // Another acquisition should succeed
+        CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() -> {
+            Reservation newReservation = shortLeaseManager.getReservation("orders", "expiry-test");
+            boolean acquired = newReservation.tryLock();
+            if (acquired) {
+                try {
+                    newReservation.unlock();
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+            return acquired;
+        });
+
+        assertThat(otherThread.get(2, TimeUnit.SECONDS)).isTrue();
+        shortLeaseManager.close();
+    }
+
+    // ==================== tryLock with Timeout Tests ====================
+
+    @Test
+    void tryLockShouldReturnTrueWhenAvailable() throws Exception {
+        Reservation reservation = manager.getReservation("orders", "trylock-available");
+
+        assertThat(reservation.tryLock(1, TimeUnit.SECONDS)).isTrue();
+        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+
+        reservation.unlock();
+    }
+
+    @Test
+    void tryLockShouldReturnFalseAfterTimeout() throws Exception {
+        Reservation holder = manager.getReservation("orders", "trylock-timeout");
+        holder.lock();
+
+        CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                Reservation waiterRes = manager.getReservation("orders", "trylock-timeout");
+                return waiterRes.tryLock(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                return false;
+            }
+        });
+
+        assertThat(waiter.get(2, TimeUnit.SECONDS)).isFalse();
+        holder.unlock();
+    }
+
+    @Test
+    void tryLockShouldSucceedWhenReleasedBeforeTimeout() throws Exception {
+        Reservation holder = manager.getReservation("orders", "trylock-release");
+        holder.lock();
+
+        CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                Reservation waiterRes = manager.getReservation("orders", "trylock-release");
+                return waiterRes.tryLock(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                return false;
+            }
+        });
+
+        // Release after a short delay
+        Thread.sleep(200);
+        holder.unlock();
+
+        assertThat(waiter.get(3, TimeUnit.SECONDS)).isTrue();
+    }
+
+    // ==================== forceUnlock Tests ====================
+
+    @Test
+    void forceUnlockShouldReleaseRegardlessOfOwner() throws Exception {
+        Reservation reservation = manager.getReservation("orders", "force-unlock");
+        reservation.lock();
+
+        // Force unlock from different context
+        Reservation admin = manager.getReservation("orders", "force-unlock");
+        admin.forceUnlock();
+
+        assertThat(reservation.isLocked()).isFalse();
+
+        // Original holder's unlock should fail
+        assertThatThrownBy(reservation::unlock)
+            .isInstanceOf(ReservationExpiredException.class);
+    }
+
+    // ==================== Reentrancy Tests ====================
+
+    @Test
+    void shouldSupportReentrantLocking() throws Exception {
+        Reservation reservation = manager.getReservation("orders", "reentrant");
+
+        reservation.lock();
+        reservation.lock(); // Reentrant
+
+        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+
+        reservation.unlock();
+        // Still held (need second unlock)
+        assertThat(reservation.isHeldByCurrentThread()).isTrue();
+
+        reservation.unlock();
+        assertThat(reservation.isLocked()).isFalse();
+    }
+
+    // ==================== Validation Tests ====================
+
+    @Test
+    void shouldRejectNullDomain() {
+        assertThatThrownBy(() -> manager.getReservation(null, "123"))
+            .isInstanceOf(InvalidReservationKeyException.class);
+    }
+
+    @Test
+    void shouldRejectEmptyDomain() {
+        assertThatThrownBy(() -> manager.getReservation("", "123"))
+            .isInstanceOf(InvalidReservationKeyException.class);
+    }
+
+    @Test
+    void shouldRejectDomainContainingDelimiter() {
+        assertThatThrownBy(() -> manager.getReservation("order::type", "123"))
+            .isInstanceOf(InvalidReservationKeyException.class);
+    }
+
+    @Test
+    void shouldRejectNullIdentifier() {
+        assertThatThrownBy(() -> manager.getReservation("orders", null))
+            .isInstanceOf(InvalidReservationKeyException.class);
+    }
+
+    // ==================== newCondition Tests ====================
+
+    @Test
+    void newConditionShouldThrowUnsupportedOperationException() {
+        Reservation reservation = manager.getReservation("orders", "condition");
+
+        assertThatThrownBy(reservation::newCondition)
+            .isInstanceOf(UnsupportedOperationException.class)
+            .hasMessageContaining("not supported");
+    }
+
+    // ==================== Interruptibility Tests ====================
+
+    @Test
+    void lockInterruptiblyShouldThrowWhenInterrupted() throws Exception {
+        Reservation holder = manager.getReservation("orders", "interrupt");
+        holder.lock();
+
+        Thread waiterThread = new Thread(() -> {
+            try {
+                Reservation waiter = manager.getReservation("orders", "interrupt");
+                waiter.lockInterruptibly();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ReservationAcquisitionException e) {
+                // expected when interrupted
+            }
+        });
+
+        waiterThread.start();
+        Thread.sleep(100);
+        waiterThread.interrupt();
+        waiterThread.join(1000);
+
+        assertThat(waiterThread.isInterrupted() || !waiterThread.isAlive()).isTrue();
+        holder.unlock();
     }
 }
 ```
 
-### 8.3 Integration Tests (Testcontainers)
+### 9.3 Hazelcast Test Implementation
 
-Realistic multi-node testing:
+```java
+package com.github.reservation.hazelcast;
+
+import com.github.reservation.*;
+import com.hazelcast.config.Config;
+import com.hazelcast.core.*;
+import org.junit.jupiter.api.*;
+import java.time.Duration;
+import java.util.UUID;
+
+class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
+
+    private static HazelcastInstance hazelcast;
+    private String mapName;
+
+    @BeforeAll
+    static void setupHazelcast() {
+        Config config = new Config();
+        config.setClusterName("test-" + UUID.randomUUID());
+        hazelcast = Hazelcast.newHazelcastInstance(config);
+    }
+
+    @AfterAll
+    static void teardownHazelcast() {
+        if (hazelcast != null) {
+            hazelcast.shutdown();
+        }
+    }
+
+    @Override
+    protected ReservationManager createManager(Duration leaseTime) {
+        mapName = "test-reservations-" + UUID.randomUUID();
+        return ReservationManager.hazelcast(hazelcast)
+            .leaseTime(leaseTime)
+            .mapName(mapName)
+            .build();
+    }
+
+    @Override
+    protected void cleanup() {
+        if (mapName != null && hazelcast != null) {
+            hazelcast.getMap(mapName).destroy();
+        }
+    }
+}
+```
+
+### 9.4 Oracle Test Implementation
+
+```java
+package com.github.reservation.oracle;
+
+import com.github.reservation.*;
+import org.junit.jupiter.api.*;
+import org.testcontainers.containers.OracleContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import javax.sql.DataSource;
+import com.zaxxer.hikari.*;
+import java.sql.*;
+import java.time.Duration;
+
+@Testcontainers
+class OracleReservationManagerTest extends AbstractReservationManagerTest {
+
+    @Container
+    static OracleContainer oracle = new OracleContainer("gvenzl/oracle-xe:21-slim-faststart")
+        .withDatabaseName("testdb")
+        .withUsername("testuser")
+        .withPassword("testpass");
+
+    private static DataSource dataSource;
+    private static final String TABLE_NAME = "RESERVATION_LOCKS";
+
+    @BeforeAll
+    static void setupDatabase() throws SQLException {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(oracle.getJdbcUrl());
+        config.setUsername(oracle.getUsername());
+        config.setPassword(oracle.getPassword());
+        config.setMaximumPoolSize(5);
+        dataSource = new HikariDataSource(config);
+
+        // Create table
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("""
+                CREATE TABLE RESERVATION_LOCKS (
+                    reservation_key  VARCHAR2(512) NOT NULL,
+                    holder           VARCHAR2(256) NOT NULL,
+                    acquired_at      TIMESTAMP     NOT NULL,
+                    expires_at       TIMESTAMP     NOT NULL,
+                    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
+                )
+                """);
+        }
+    }
+
+    @Override
+    protected ReservationManager createManager(Duration leaseTime) {
+        return ReservationManager.oracle(dataSource)
+            .leaseTime(leaseTime)
+            .tableName(TABLE_NAME)
+            .build();
+    }
+
+    @Override
+    protected void cleanup() {
+        // Clean table between tests
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("DELETE FROM " + TABLE_NAME);
+        } catch (SQLException e) {
+            // ignore
+        }
+    }
+}
+```
+
+### 9.5 Integration Tests with Testcontainers
+
+For full integration testing with real Hazelcast cluster:
 
 ```java
 @Testcontainers
-class SoftLockIntegrationTest {
+class HazelcastIntegrationTest extends AbstractReservationManagerTest {
 
     @Container
     static HazelcastContainer hazelcast = new HazelcastContainer("hazelcast/hazelcast:5.3");
 
     private HazelcastInstance client;
-    private SoftLockManager manager;
+    private String mapName;
 
-    @BeforeEach
-    void setup() {
+    @Override
+    protected ReservationManager createManager(Duration leaseTime) {
         ClientConfig config = new ClientConfig();
-        config.getNetworkConfig().addAddress(hazelcast.getHost() + ":" + hazelcast.getFirstMappedPort());
+        config.getNetworkConfig().addAddress(
+            hazelcast.getHost() + ":" + hazelcast.getFirstMappedPort());
         client = HazelcastClient.newHazelcastClient(config);
-        manager = SoftLockManager.builder(client).build();
+
+        mapName = "test-reservations-" + UUID.randomUUID();
+        return ReservationManager.hazelcast(client)
+            .leaseTime(leaseTime)
+            .mapName(mapName)
+            .build();
     }
 
-    @Test
-    void shouldHandleMultipleClientsCompeting() throws Exception {
-        // Create second client
-        HazelcastInstance client2 = HazelcastClient.newHazelcastClient(/*...*/);
-        SoftLockManager manager2 = SoftLockManager.builder(client2).build();
-
-        SoftLock lock1 = manager.getLock("test", "shared");
-        SoftLock lock2 = manager2.getLock("test", "shared");
-
-        lock1.lock();
-        assertThat(lock2.tryLock()).isFalse();
-
-        lock1.unlock();
-        assertThat(lock2.tryLock()).isTrue();
-        lock2.unlock();
-    }
-}
-```
-
-### 8.4 Test Categories
-
-| Category | Framework | Purpose | Examples |
-|----------|-----------|---------|----------|
-| Unit | JUnit 5 + Embedded HZ | Core logic, fast feedback | Lock/unlock, expiration, reentrancy |
-| Integration | Testcontainers | Multi-client scenarios | Competing clients, failover |
-| Concurrency | JCStress / custom | Thread safety | Race conditions, visibility |
-| Performance | JMH | Benchmarks | Throughput, latency |
-
----
-
-## 9. Performance Considerations
-
-### 9.1 Lock Operation Costs
-
-| Operation | Expected Latency | Notes |
-|-----------|------------------|-------|
-| `lock()` (uncontended) | < 1ms (local cluster) | Network RTT to partition owner |
-| `tryLock()` (uncontended) | < 1ms | Same as lock() |
-| `unlock()` | < 1ms | Network RTT |
-| `isLocked()` | < 1ms | Read operation |
-
-### 9.2 Optimization Guidelines
-
-1. **Lock Granularity**: Use fine-grained identifiers to reduce contention
-   - Good: `("orders", "order-12345")`
-   - Bad: `("orders", "all")`
-
-2. **Lease Time Tuning**: Balance between:
-   - Too short: Frequent expirations, potential violations
-   - Too long: Resources blocked longer on failures
-
-3. **Map Partitioning**: Hazelcast distributes locks across partitions
-   - Diverse domains/identifiers = better distribution
-
-4. **Client Proximity**: Deploy clients close to Hazelcast nodes
-
-### 9.3 Benchmarking Plan
-
-```java
-@BenchmarkMode(Mode.Throughput)
-@OutputTimeUnit(TimeUnit.SECONDS)
-public class SoftLockBenchmark {
-
-    @Benchmark
-    public void lockUnlockCycle(BenchmarkState state) throws Exception {
-        SoftLock lock = state.manager.getLock("bench", "key-" + ThreadLocalRandom.current().nextInt(1000));
-        lock.lock();
-        lock.unlock();
-    }
-
-    @Benchmark
-    public void tryLockContended(BenchmarkState state) {
-        SoftLock lock = state.manager.getLock("bench", "contended");
-        if (lock.tryLock()) {
-            lock.unlock();
+    @Override
+    protected void cleanup() {
+        if (client != null) {
+            client.shutdown();
         }
     }
 }
@@ -947,62 +1780,122 @@ public class SoftLockBenchmark {
 
 ---
 
-## 10. Project Structure
+## 10. Performance Considerations
+
+### 10.1 Operation Latencies
+
+| Operation | Hazelcast | Oracle (Table-based) |
+|-----------|-----------|---------------------|
+| `lock()` (uncontended) | < 1ms | 5-20ms |
+| `tryLock()` (uncontended) | < 1ms | 5-20ms |
+| `unlock()` | < 1ms | 5-20ms |
+| `isLocked()` | < 1ms | 5-20ms |
+| Polling interval (contended) | N/A | 100ms - 2s (exponential) |
+
+### 10.2 Hazelcast Optimization
+
+1. **Client Proximity**: Deploy clients close to Hazelcast nodes
+2. **Lock Granularity**: Use fine-grained identifiers
+3. **Map Partitioning**: Diverse keys = better distribution
+
+### 10.3 Oracle Optimization
+
+1. **Connection Pool**: Properly sized (10-20 connections typical)
+2. **Index on expires_at**: For efficient cleanup queries
+3. **Polling Tuning**: Adjust `POLL_INTERVAL` and `MAX_POLL_INTERVAL` for your use case
+4. **Cleanup Strategy**: Consider periodic batch cleanup for expired locks
+
+### 10.4 Choosing Between Implementations
+
+| Use Case | Recommended |
+|----------|-------------|
+| Already using Hazelcast | Hazelcast |
+| Low latency required | Hazelcast |
+| Existing Oracle infrastructure, no Hazelcast | Oracle |
+| Strong ACID requirements | Oracle |
+| Audit trail needed | Oracle (table queryable) |
+
+---
+
+## 11. Project Structure
 
 ```
-hazelcast-soft-lock/
+reservation-lock/
 ├── pom.xml
 ├── README.md
 ├── docs/
-│   └── DESIGN.md                          # This document
+│   └── DESIGN.md                              # This document
 ├── src/
 │   ├── main/
 │   │   └── java/
 │   │       └── com/
 │   │           └── github/
-│   │               └── softlock/
-│   │                   ├── SoftLock.java                # Main interface
-│   │                   ├── SoftLockManager.java         # Factory interface
-│   │                   ├── SoftLockManagerBuilder.java  # Builder
-│   │                   ├── SoftLockException.java       # Base exception
-│   │                   ├── LockAcquisitionException.java
-│   │                   ├── LockExpiredException.java
-│   │                   ├── InvalidLockKeyException.java
+│   │               └── reservation/
+│   │                   ├── Reservation.java                    # Main interface
+│   │                   ├── ReservationManager.java             # Factory interface
+│   │                   ├── AbstractReservationManagerBuilder.java
+│   │                   ├── HazelcastReservationManagerBuilder.java
+│   │                   ├── OracleReservationManagerBuilder.java
+│   │                   ├── ReservationException.java           # Base exception
+│   │                   ├── ReservationAcquisitionException.java
+│   │                   ├── ReservationExpiredException.java
+│   │                   ├── InvalidReservationKeyException.java
+│   │                   ├── hazelcast/
+│   │                   │   ├── HazelcastReservationManager.java
+│   │                   │   ├── HazelcastReservation.java
+│   │                   │   └── ReservationValueBuilder.java
+│   │                   ├── oracle/
+│   │                   │   ├── OracleReservationManager.java
+│   │                   │   ├── OracleReservation.java
+│   │                   │   ├── LockingStrategy.java            # Strategy interface
+│   │                   │   ├── LockingException.java
+│   │                   │   └── TableBasedLockingStrategy.java  # Default impl
 │   │                   └── internal/
-│   │                       ├── DefaultSoftLockManager.java
-│   │                       ├── DefaultSoftLock.java
-│   │                       ├── LockKeyBuilder.java
-│   │                       └── SoftLockMetrics.java
+│   │                       ├── ReservationKeyBuilder.java
+│   │                       └── ReservationMetrics.java
 │   └── test/
 │       └── java/
 │           └── com/
 │               └── github/
-│                   └── softlock/
-│                       ├── SoftLockTest.java            # Unit tests
-│                       ├── SoftLockManagerTest.java
-│                       ├── LockKeyBuilderTest.java
-│                       ├── integration/
-│                       │   └── SoftLockIntegrationTest.java
+│                   └── reservation/
+│                       ├── AbstractReservationManagerTest.java  # Shared tests
+│                       ├── ReservationKeyBuilderTest.java
+│                       ├── hazelcast/
+│                       │   ├── HazelcastReservationManagerTest.java
+│                       │   └── HazelcastIntegrationTest.java
+│                       ├── oracle/
+│                       │   ├── OracleReservationManagerTest.java
+│                       │   └── TableBasedLockingStrategyTest.java
 │                       └── benchmark/
-│                           └── SoftLockBenchmark.java
+│                           └── ReservationBenchmark.java
 ```
 
 ---
 
-## 11. Dependencies
+## 12. Dependencies
 
-### 11.1 Runtime Dependencies
+### 12.1 Runtime Dependencies
 
 ```xml
 <dependencies>
-    <!-- Hazelcast Client -->
+    <!-- Hazelcast Client (optional - for Hazelcast backend) -->
     <dependency>
         <groupId>com.hazelcast</groupId>
         <artifactId>hazelcast</artifactId>
         <version>5.3.6</version>
+        <optional>true</optional>
     </dependency>
 
-    <!-- Micrometer (optional, for metrics) -->
+    <!-- Oracle JDBC (optional - for Oracle backend) -->
+    <dependency>
+        <groupId>com.oracle.database.jdbc</groupId>
+        <artifactId>ojdbc11</artifactId>
+        <version>23.3.0.23.09</version>
+        <optional>true</optional>
+        <scope>provided</scope>
+    </dependency>
+
+    <!-- Micrometer (optional - for metrics) -->
     <dependency>
         <groupId>io.micrometer</groupId>
         <artifactId>micrometer-core</artifactId>
@@ -1012,7 +1905,7 @@ hazelcast-soft-lock/
 </dependencies>
 ```
 
-### 11.2 Test Dependencies
+### 12.2 Test Dependencies
 
 ```xml
 <dependencies>
@@ -1045,8 +1938,22 @@ hazelcast-soft-lock/
         <version>1.19.3</version>
         <scope>test</scope>
     </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>oracle-xe</artifactId>
+        <version>1.19.3</version>
+        <scope>test</scope>
+    </dependency>
 
-    <!-- Awaitility (for async assertions) -->
+    <!-- HikariCP for Oracle tests -->
+    <dependency>
+        <groupId>com.zaxxer</groupId>
+        <artifactId>HikariCP</artifactId>
+        <version>5.1.0</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Awaitility -->
     <dependency>
         <groupId>org.awaitility</groupId>
         <artifactId>awaitility</artifactId>
@@ -1056,7 +1963,7 @@ hazelcast-soft-lock/
 </dependencies>
 ```
 
-### 11.3 Build Configuration
+### 12.3 Build Configuration
 
 ```xml
 <properties>
@@ -1091,67 +1998,90 @@ hazelcast-soft-lock/
 
 ---
 
-## 12. Roadmap
+## 13. Roadmap
 
 ### Phase 1: Core Implementation
 1. Project setup (Maven, dependencies, structure)
-2. Core interfaces (`SoftLock`, `SoftLockManager`)
+2. Core interfaces (`Reservation`, `ReservationManager`)
 3. Exception hierarchy
-4. `DefaultSoftLockManager` implementation
-5. `DefaultSoftLock` implementation
-6. Unit tests with embedded Hazelcast
+4. Key builder with validation
+5. `HazelcastReservationManager` implementation
+6. `HazelcastReservation` implementation
+7. Unit tests with embedded Hazelcast
 
-### Phase 2: Quality & Testing
-7. Integration tests with Testcontainers
-8. Concurrency tests
-9. Edge case handling (expiration, interruption)
-10. Javadoc documentation
+### Phase 2: Oracle Implementation
+8. `LockingStrategy` interface
+9. `TableBasedLockingStrategy` implementation
+10. `OracleReservationManager` implementation
+11. `OracleReservation` implementation
+12. Unit tests with Testcontainers Oracle
 
-### Phase 3: Observability
-11. Micrometer metrics integration
-12. Metric documentation
+### Phase 3: Shared Testing & Quality
+13. Abstract base test class
+14. Run same tests on both implementations
+15. Integration tests with Testcontainers
+16. Concurrency stress tests
+17. Edge case handling
 
-### Phase 4: Polish
-13. README with usage examples
-14. Performance benchmarks (JMH)
-15. CI/CD pipeline setup (optional)
+### Phase 4: Observability
+18. Micrometer metrics integration
+19. Metric documentation
+
+### Phase 5: Polish
+20. README with usage examples
+21. Javadoc documentation
+22. Performance benchmarks (JMH)
+23. Schema documentation for Oracle
 
 ---
 
 ## Appendix A: Usage Examples
 
-### Basic Usage
+### Basic Usage (Hazelcast)
 
 ```java
-// Setup
 HazelcastInstance hz = HazelcastClient.newHazelcastClient();
-SoftLockManager lockManager = SoftLockManager.builder(hz)
+ReservationManager manager = ReservationManager.hazelcast(hz)
     .leaseTime(Duration.ofMinutes(2))
     .build();
 
-// Acquire and use lock
-SoftLock lock = lockManager.getLock("orders", "order-12345");
-lock.lock();
+Reservation reservation = manager.getReservation("orders", "order-12345");
+reservation.lock();
 try {
-    // Process order - guaranteed exclusive for up to 2 minutes
     processOrder("order-12345");
 } finally {
-    lock.unlock();
+    reservation.unlock();
+}
+```
+
+### Basic Usage (Oracle)
+
+```java
+DataSource dataSource = getDataSource();
+ReservationManager manager = ReservationManager.oracle(dataSource)
+    .leaseTime(Duration.ofMinutes(2))
+    .build();
+
+Reservation reservation = manager.getReservation("orders", "order-12345");
+reservation.lock();
+try {
+    processOrder("order-12345");
+} finally {
+    reservation.unlock();
 }
 ```
 
 ### Try-Lock Pattern
 
 ```java
-SoftLock lock = lockManager.getLock("inventory", "sku-ABC123");
-if (lock.tryLock(5, TimeUnit.SECONDS)) {
+Reservation reservation = manager.getReservation("inventory", "sku-ABC123");
+if (reservation.tryLock(5, TimeUnit.SECONDS)) {
     try {
         updateInventory("sku-ABC123");
     } finally {
-        lock.unlock();
+        reservation.unlock();
     }
 } else {
-    // Could not acquire lock within 5 seconds
     throw new ResourceBusyException("Inventory item is locked");
 }
 ```
@@ -1159,33 +2089,76 @@ if (lock.tryLock(5, TimeUnit.SECONDS)) {
 ### Handling Expiration
 
 ```java
-SoftLock lock = lockManager.getLock("reports", "daily-report");
-lock.lock();
+Reservation reservation = manager.getReservation("reports", "daily-report");
+reservation.lock();
 try {
     generateDailyReport(); // Long-running operation
-} catch (LockExpiredException e) {
-    // Lock expired during processing!
-    log.error("Report generation took too long, lock expired. " +
-              "Another process may have started generating the same report.");
-    // Consider: abort, retry with longer lease, or alert
 } finally {
     try {
-        lock.unlock();
-    } catch (LockExpiredException ignored) {
-        // Already logged above
+        reservation.unlock();
+    } catch (ReservationExpiredException e) {
+        log.error("Report generation took too long, lock expired. " +
+                  "Another process may have started generating the same report.");
     }
 }
 ```
 
+### Custom Locking Strategy (Oracle)
+
+```java
+// Implement custom strategy
+class MyCustomLockingStrategy implements LockingStrategy {
+    // ... custom implementation
+}
+
+// Use custom strategy
+ReservationManager manager = ReservationManager.oracle(dataSource)
+    .lockingStrategy(new MyCustomLockingStrategy())
+    .build();
+```
+
 ---
 
-## Appendix B: Open Questions / Future Considerations
+## Appendix B: Oracle Schema Reference
 
-1. **Lock extension**: Should we support extending lease time while holding the lock?
+```sql
+-- Required table (create before using library)
+CREATE TABLE RESERVATION_LOCKS (
+    reservation_key  VARCHAR2(512)  NOT NULL,
+    holder           VARCHAR2(256)  NOT NULL,
+    acquired_at      TIMESTAMP      NOT NULL,
+    expires_at       TIMESTAMP      NOT NULL,
+    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
+);
+
+CREATE INDEX idx_reservation_locks_expires ON RESERVATION_LOCKS (expires_at);
+
+-- Optional: Grant to application user
+GRANT SELECT, INSERT, UPDATE, DELETE ON RESERVATION_LOCKS TO app_user;
+
+-- Optional: Scheduled cleanup job
+BEGIN
+    DBMS_SCHEDULER.CREATE_JOB(
+        job_name        => 'CLEANUP_EXPIRED_RESERVATIONS',
+        job_type        => 'PLSQL_BLOCK',
+        job_action      => 'DELETE FROM RESERVATION_LOCKS WHERE expires_at < SYSTIMESTAMP;',
+        repeat_interval => 'FREQ=HOURLY',
+        enabled         => TRUE
+    );
+END;
+/
+```
+
+---
+
+## Appendix C: Open Questions / Future Considerations
+
+1. **Lock extension**: Should we support extending lease time while holding?
 2. **Lock callbacks**: Event hooks for acquisition/release/expiration?
-3. **Distributed Condition**: Alternative coordination patterns?
-4. **Spring Integration**: Auto-configuration, `@SoftLocked` annotation?
-5. **Lock querying**: Ability to list all locks in a domain?
+3. **Spring Integration**: Auto-configuration, `@Reserved` annotation?
+4. **Lock querying**: Ability to list all locks in a domain?
+5. **Alternative Oracle strategies**: DBMS_LOCK, SELECT FOR UPDATE, AQ?
+6. **Multi-datacenter**: Support for geo-distributed locking?
 
 ---
 
