@@ -21,6 +21,8 @@ public final class OracleReservationManager implements ReservationManager {
     private final String domain;
     private final Duration leaseTime;
     private final String tableName;
+    private final Duration initialPollInterval;
+    private final Duration maxPollInterval;
     private final ReservationMetrics metrics;
 
     OracleReservationManager(
@@ -29,12 +31,16 @@ public final class OracleReservationManager implements ReservationManager {
             String domain,
             Duration leaseTime,
             String tableName,
+            Duration initialPollInterval,
+            Duration maxPollInterval,
             MeterRegistry meterRegistry) {
         this.dataSource = dataSource;
         this.lockingStrategy = lockingStrategy;
         this.domain = domain;
         this.leaseTime = leaseTime;
         this.tableName = tableName;
+        this.initialPollInterval = initialPollInterval;
+        this.maxPollInterval = maxPollInterval;
         this.metrics = new ReservationMetrics(meterRegistry, "oracle");
     }
 
@@ -51,6 +57,8 @@ public final class OracleReservationManager implements ReservationManager {
             identifier,
             reservationKey,
             leaseTime,
+            initialPollInterval,
+            maxPollInterval,
             metrics
         );
     }

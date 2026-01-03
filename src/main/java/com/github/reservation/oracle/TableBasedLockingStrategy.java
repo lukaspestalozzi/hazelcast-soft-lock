@@ -12,10 +12,16 @@ import java.util.Optional;
 /**
  * Default locking strategy using a custom table with TTL-based expiration.
  *
- * <p>This strategy uses optimistic locking: successful INSERT = lock acquired,
- * constraint violation = lock already held.</p>
+ * <p>This strategy uses an UPDATE-then-INSERT pattern inspired by Spring Integration's
+ * JdbcLockRegistry: first attempt to UPDATE an existing lock (if owned by same holder
+ * or expired), then INSERT if no matching row exists.</p>
  *
- * <p>Expired locks are cleaned up lazily on acquisition attempts.</p>
+ * <p>This approach is more efficient than DELETE-then-INSERT because:</p>
+ * <ul>
+ *   <li>Reentrant locks (same holder) require only 1 UPDATE</li>
+ *   <li>Expired lock acquisition requires only 1 UPDATE</li>
+ *   <li>New locks require UPDATE (0 rows) + INSERT</li>
+ * </ul>
  *
  * <p>Required table schema:</p>
  * <pre>{@code
@@ -37,11 +43,10 @@ public class TableBasedLockingStrategy implements LockingStrategy {
 
     // SQL statements
     private final String insertSql;
+    private final String updateOrAcquireSql;
     private final String deleteSql;
     private final String deleteForceSql;
     private final String selectSql;
-    private final String cleanupExpiredSql;
-    private final String updateSql;
 
     public TableBasedLockingStrategy(DataSource dataSource, String tableName) {
         this.dataSource = dataSource;
@@ -52,20 +57,21 @@ public class TableBasedLockingStrategy implements LockingStrategy {
         this.insertSql = String.format(
             "INSERT INTO %s (reservation_key, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
             tableName);
+
+        // UPDATE-then-INSERT pattern: update if owned by same holder OR expired
+        this.updateOrAcquireSql = String.format(
+            "UPDATE %s SET holder = ?, acquired_at = ?, expires_at = ? " +
+            "WHERE reservation_key = ? AND (holder = ? OR expires_at < ?)",
+            tableName);
+
         this.deleteSql = String.format(
-            "DELETE FROM %s WHERE reservation_key = ? AND holder = ?",
+            "DELETE FROM %s WHERE reservation_key = ? AND holder = ? AND expires_at > ?",
             tableName);
         this.deleteForceSql = String.format(
             "DELETE FROM %s WHERE reservation_key = ?",
             tableName);
         this.selectSql = String.format(
             "SELECT holder, acquired_at, expires_at FROM %s WHERE reservation_key = ? AND expires_at > ?",
-            tableName);
-        this.cleanupExpiredSql = String.format(
-            "DELETE FROM %s WHERE reservation_key = ? AND expires_at <= ?",
-            tableName);
-        this.updateSql = String.format(
-            "UPDATE %s SET holder = ?, acquired_at = ?, expires_at = ? WHERE reservation_key = ? AND holder = ?",
             tableName);
     }
 
@@ -75,13 +81,27 @@ public class TableBasedLockingStrategy implements LockingStrategy {
             conn.setAutoCommit(false);
             try {
                 Timestamp now = Timestamp.from(Instant.now());
-
-                // First, clean up any expired lock for this key
-                cleanupExpired(conn, reservationKey, now);
-
-                // Try to insert new lock
                 Timestamp expiresAt = Timestamp.from(Instant.now().plus(leaseTime));
 
+                // Step 1: Try UPDATE - succeeds if we own the lock OR lock is expired
+                int updated;
+                try (PreparedStatement ps = conn.prepareStatement(updateOrAcquireSql)) {
+                    ps.setString(1, holder);      // new holder
+                    ps.setTimestamp(2, now);      // new acquired_at
+                    ps.setTimestamp(3, expiresAt); // new expires_at
+                    ps.setString(4, reservationKey);
+                    ps.setString(5, holder);      // match current holder (reentrant)
+                    ps.setTimestamp(6, now);      // OR expired (expires_at < now)
+                    updated = ps.executeUpdate();
+                }
+
+                if (updated > 0) {
+                    conn.commit();
+                    log.debug("Acquired lock (via update): {} by {}", reservationKey, holder);
+                    return true;
+                }
+
+                // Step 2: No existing row matched - try INSERT for new lock
                 try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
                     ps.setString(1, reservationKey);
                     ps.setString(2, holder);
@@ -91,13 +111,13 @@ public class TableBasedLockingStrategy implements LockingStrategy {
                 }
 
                 conn.commit();
-                log.debug("Acquired lock: {} by {}", reservationKey, holder);
+                log.debug("Acquired lock (via insert): {} by {}", reservationKey, holder);
                 return true;
 
             } catch (SQLException e) {
                 conn.rollback();
 
-                // Check if it's a unique constraint violation (lock already held)
+                // Check if it's a unique constraint violation (lock held by another)
                 if (isUniqueConstraintViolation(e)) {
                     log.debug("Lock already held: {}", reservationKey);
                     return false;
@@ -175,17 +195,6 @@ public class TableBasedLockingStrategy implements LockingStrategy {
         }
     }
 
-    private void cleanupExpired(Connection conn, String reservationKey, Timestamp now) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(cleanupExpiredSql)) {
-            ps.setString(1, reservationKey);
-            ps.setTimestamp(2, now);
-            int deleted = ps.executeUpdate();
-            if (deleted > 0) {
-                log.debug("Cleaned up expired lock: {}", reservationKey);
-            }
-        }
-    }
-
     private boolean isUniqueConstraintViolation(SQLException e) {
         // Check for various database-specific unique constraint violation codes
         String sqlState = e.getSQLState();
@@ -209,5 +218,81 @@ public class TableBasedLockingStrategy implements LockingStrategy {
      */
     public String getTableName() {
         return tableName;
+    }
+
+    /**
+     * Validates that the required table exists with the expected schema.
+     *
+     * <p>Checks for:</p>
+     * <ul>
+     *   <li>Table existence</li>
+     *   <li>Required columns: reservation_key, holder, acquired_at, expires_at</li>
+     * </ul>
+     *
+     * @throws LockingException if validation fails
+     */
+    public void validateSchema() throws LockingException {
+        try (Connection conn = dataSource.getConnection()) {
+            DatabaseMetaData metaData = conn.getMetaData();
+
+            // Check table exists (try uppercase and lowercase for compatibility)
+            boolean tableExists = false;
+            String actualTableName = null;
+
+            try (ResultSet tables = metaData.getTables(null, null, tableName.toUpperCase(), new String[]{"TABLE"})) {
+                if (tables.next()) {
+                    tableExists = true;
+                    actualTableName = tables.getString("TABLE_NAME");
+                }
+            }
+
+            if (!tableExists) {
+                try (ResultSet tables = metaData.getTables(null, null, tableName.toLowerCase(), new String[]{"TABLE"})) {
+                    if (tables.next()) {
+                        tableExists = true;
+                        actualTableName = tables.getString("TABLE_NAME");
+                    }
+                }
+            }
+
+            if (!tableExists) {
+                throw new LockingException("Table '" + tableName + "' does not exist. " +
+                    "Please create it using the following schema:\n" +
+                    "CREATE TABLE " + tableName + " (\n" +
+                    "    reservation_key  VARCHAR(512)  NOT NULL,\n" +
+                    "    holder           VARCHAR(256)  NOT NULL,\n" +
+                    "    acquired_at      TIMESTAMP     NOT NULL,\n" +
+                    "    expires_at       TIMESTAMP     NOT NULL,\n" +
+                    "    PRIMARY KEY (reservation_key)\n" +
+                    ");");
+            }
+
+            // Check required columns exist
+            String[] requiredColumns = {"reservation_key", "holder", "acquired_at", "expires_at"};
+            java.util.Set<String> foundColumns = new java.util.HashSet<>();
+
+            try (ResultSet columns = metaData.getColumns(null, null, actualTableName, null)) {
+                while (columns.next()) {
+                    foundColumns.add(columns.getString("COLUMN_NAME").toLowerCase());
+                }
+            }
+
+            java.util.List<String> missingColumns = new java.util.ArrayList<>();
+            for (String required : requiredColumns) {
+                if (!foundColumns.contains(required.toLowerCase())) {
+                    missingColumns.add(required);
+                }
+            }
+
+            if (!missingColumns.isEmpty()) {
+                throw new LockingException("Table '" + tableName + "' is missing required columns: " +
+                    String.join(", ", missingColumns));
+            }
+
+            log.debug("Schema validation passed for table: {}", tableName);
+
+        } catch (SQLException e) {
+            throw new LockingException("Failed to validate schema for table: " + tableName, e);
+        }
     }
 }

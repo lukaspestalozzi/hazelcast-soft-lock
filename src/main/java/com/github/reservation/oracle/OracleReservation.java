@@ -21,14 +21,13 @@ final class OracleReservation implements Reservation {
 
     private static final Logger log = LoggerFactory.getLogger(OracleReservation.class);
 
-    private static final Duration INITIAL_POLL_INTERVAL = Duration.ofMillis(50);
-    private static final Duration MAX_POLL_INTERVAL = Duration.ofSeconds(1);
-
     private final LockingStrategy lockingStrategy;
     private final String domain;
     private final String identifier;
     private final String reservationKey;
     private final Duration leaseTime;
+    private final Duration initialPollInterval;
+    private final Duration maxPollInterval;
     private final ReservationMetrics metrics;
 
     // Track the holder ID for this thread
@@ -42,12 +41,16 @@ final class OracleReservation implements Reservation {
             String identifier,
             String reservationKey,
             Duration leaseTime,
+            Duration initialPollInterval,
+            Duration maxPollInterval,
             ReservationMetrics metrics) {
         this.lockingStrategy = lockingStrategy;
         this.domain = domain;
         this.identifier = identifier;
         this.reservationKey = reservationKey;
         this.leaseTime = leaseTime;
+        this.initialPollInterval = initialPollInterval;
+        this.maxPollInterval = maxPollInterval;
         this.metrics = metrics;
     }
 
@@ -84,20 +87,14 @@ final class OracleReservation implements Reservation {
 
     /**
      * Internal check for reentrancy - checks if current thread holds this lock.
+     *
+     * <p>This uses local ThreadLocal state only, avoiding a database roundtrip.
+     * If the thread previously acquired this lock and hasn't released it, we trust
+     * that state. The lock may have expired in the database, but that will be
+     * detected at unlock time (and throw ReservationExpiredException).</p>
      */
     private boolean heldByCurrentThread() {
-        String holder = currentHolder.get();
-        if (holder == null) {
-            return false;
-        }
-
-        try {
-            Optional<LockingStrategy.LockInfo> info = lockingStrategy.getLockInfo(reservationKey);
-            return info.map(i -> holder.equals(i.holder())).orElse(false);
-        } catch (LockingException e) {
-            log.warn("Failed to check lock ownership for {}: {}", reservationKey, e.getMessage());
-            return false;
-        }
+        return currentHolder.get() != null && lockCount.get() > 0;
     }
 
     @Override
@@ -124,7 +121,7 @@ final class OracleReservation implements Reservation {
 
         String holder = buildHolder();
         Instant start = Instant.now();
-        Duration pollInterval = INITIAL_POLL_INTERVAL;
+        Duration pollInterval = initialPollInterval;
 
         while (true) {
             try {
@@ -144,8 +141,8 @@ final class OracleReservation implements Reservation {
                 // Lock not available, wait and retry
                 Thread.sleep(pollInterval.toMillis());
                 pollInterval = pollInterval.multipliedBy(2);
-                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
-                    pollInterval = MAX_POLL_INTERVAL;
+                if (pollInterval.compareTo(maxPollInterval) > 0) {
+                    pollInterval = maxPollInterval;
                 }
 
             } catch (InterruptedException e) {
@@ -181,7 +178,7 @@ final class OracleReservation implements Reservation {
 
         String holder = buildHolder();
         Instant start = Instant.now();
-        Duration pollInterval = INITIAL_POLL_INTERVAL;
+        Duration pollInterval = initialPollInterval;
 
         while (true) {
             if (Thread.interrupted()) {
@@ -204,8 +201,8 @@ final class OracleReservation implements Reservation {
 
                 Thread.sleep(pollInterval.toMillis());
                 pollInterval = pollInterval.multipliedBy(2);
-                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
-                    pollInterval = MAX_POLL_INTERVAL;
+                if (pollInterval.compareTo(maxPollInterval) > 0) {
+                    pollInterval = maxPollInterval;
                 }
 
             } catch (InterruptedException e) {
@@ -280,7 +277,7 @@ final class OracleReservation implements Reservation {
         String holder = buildHolder();
         Instant start = Instant.now();
         long deadlineNanos = System.nanoTime() + unit.toNanos(time);
-        Duration pollInterval = INITIAL_POLL_INTERVAL;
+        Duration pollInterval = initialPollInterval;
 
         while (System.nanoTime() < deadlineNanos) {
             if (Thread.interrupted()) {
@@ -313,8 +310,8 @@ final class OracleReservation implements Reservation {
                 }
 
                 pollInterval = pollInterval.multipliedBy(2);
-                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
-                    pollInterval = MAX_POLL_INTERVAL;
+                if (pollInterval.compareTo(maxPollInterval) > 0) {
+                    pollInterval = maxPollInterval;
                 }
 
             } catch (InterruptedException e) {
