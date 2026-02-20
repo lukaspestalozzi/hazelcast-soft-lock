@@ -1,71 +1,49 @@
 package com.github.reservation.internal;
 
-import io.micrometer.core.instrument.Counter;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Timer;
-
 import java.time.Duration;
 
 /**
- * Micrometer metrics for reservation operations.
+ * Metrics interface for reservation operations. Decoupled from Micrometer
+ * so the library works without Micrometer on the classpath.
+ *
+ * <p>Use {@link #create(Object, String)} to obtain an instance. Pass a
+ * {@code MeterRegistry} to enable metrics, or {@code null} for no-op.</p>
  */
-public final class ReservationMetrics {
+public interface ReservationMetrics {
 
-    private final MeterRegistry registry;
-    private final String backend;
+    void recordAcquisition(String domain, Duration elapsed, String result);
 
-    public ReservationMetrics(MeterRegistry registry, String backend) {
-        this.registry = registry;
-        this.backend = backend;
+    void recordAcquisitionAttempt(String domain, boolean success);
+
+    void recordHeldTime(String domain, Duration elapsed);
+
+    void recordExpiration(String domain);
+
+    /**
+     * Creates a ReservationMetrics instance. If {@code meterRegistry} is non-null
+     * and Micrometer is on the classpath, returns a Micrometer-backed implementation.
+     * Otherwise returns a no-op.
+     *
+     * @param meterRegistry a {@code io.micrometer.core.instrument.MeterRegistry}, or null
+     * @param backend backend identifier tag (e.g. "hazelcast", "oracle")
+     * @return a metrics instance, never null
+     */
+    static ReservationMetrics create(Object meterRegistry, String backend) {
+        if (meterRegistry == null) {
+            return NoOpReservationMetrics.INSTANCE;
+        }
+        if (!isMicrometerAvailable()) {
+            return NoOpReservationMetrics.INSTANCE;
+        }
+        return new MicrometerReservationMetrics(meterRegistry, backend);
     }
 
-    public void recordAcquisition(String domain, Duration elapsed, String result) {
-        if (registry == null) return;
-
-        Timer.builder("reservation.acquire")
-            .description("Time to acquire reservation")
-            .tag("domain", domain)
-            .tag("backend", backend)
-            .tag("result", result)
-            .register(registry)
-            .record(elapsed);
-    }
-
-    public void recordAcquisitionAttempt(String domain, boolean success) {
-        if (registry == null) return;
-
-        Counter.builder("reservation.acquire.attempts")
-            .description("Number of acquisition attempts")
-            .tag("domain", domain)
-            .tag("backend", backend)
-            .tag("result", success ? "success" : "failure")
-            .register(registry)
-            .increment();
-    }
-
-    public void recordHeldTime(String domain, Duration elapsed) {
-        if (registry == null) return;
-
-        Timer.builder("reservation.held.time")
-            .description("Time reservation was held")
-            .tag("domain", domain)
-            .tag("backend", backend)
-            .register(registry)
-            .record(elapsed);
-    }
-
-    public void recordExpiration(String domain) {
-        if (registry == null) return;
-
-        Counter.builder("reservation.expired")
-            .description("Number of reservations that expired before unlock")
-            .tag("domain", domain)
-            .tag("backend", backend)
-            .register(registry)
-            .increment();
-    }
-
-    public boolean isEnabled() {
-        return registry != null;
+    private static boolean isMicrometerAvailable() {
+        try {
+            Class.forName("io.micrometer.core.instrument.MeterRegistry");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
     }
 }

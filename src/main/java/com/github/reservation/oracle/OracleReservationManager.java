@@ -4,7 +4,6 @@ import com.github.reservation.InvalidReservationKeyException;
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationManager;
 import com.github.reservation.internal.ReservationMetrics;
-import io.micrometer.core.instrument.MeterRegistry;
 
 import javax.sql.DataSource;
 import java.time.Duration;
@@ -29,13 +28,13 @@ public final class OracleReservationManager implements ReservationManager {
             String domain,
             Duration leaseTime,
             String tableName,
-            MeterRegistry meterRegistry) {
+            Object meterRegistry) {
         this.dataSource = dataSource;
         this.lockingStrategy = lockingStrategy;
         this.domain = domain;
         this.leaseTime = leaseTime;
         this.tableName = tableName;
-        this.metrics = new ReservationMetrics(meterRegistry, "oracle");
+        this.metrics = ReservationMetrics.create(meterRegistry, "oracle");
     }
 
     @Override
