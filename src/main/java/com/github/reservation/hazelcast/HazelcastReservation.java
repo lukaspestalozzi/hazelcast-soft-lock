@@ -24,6 +24,9 @@ final class HazelcastReservation implements Reservation {
     /** Poll interval for lockInterruptibly — IMap.lock() is not interruptible. */
     private static final long INTERRUPTIBLE_POLL_MS = 200;
 
+    /** Cached hostname — InetAddress.getLocalHost() can trigger DNS lookups. */
+    private static final String HOST_NAME = resolveHostName();
+
     private final IMap<String, String> lockMap;
     private final String domain;
     private final String identifier;
@@ -253,14 +256,11 @@ final class HazelcastReservation implements Reservation {
     }
 
     private String buildDebugValue() {
-        String threadName = Thread.currentThread().getName();
-        String hostName = getHostName();
-        Instant now = Instant.now();
-
-        return String.format("holder=%s@%s,acquired=%s", threadName, hostName, now);
+        return String.format("holder=%s@%s,acquired=%s",
+            Thread.currentThread().getName(), HOST_NAME, Instant.now());
     }
 
-    private static String getHostName() {
+    private static String resolveHostName() {
         try {
             return InetAddress.getLocalHost().getHostName();
         } catch (UnknownHostException e) {
