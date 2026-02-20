@@ -223,10 +223,8 @@ final class HazelcastReservation implements Reservation {
     @Override
     public void unlock() {
         try {
-            // Remove the debug value first
-            lockMap.remove(identifier);
-
-            // Then release the lock
+            // Release the lock first. For reentrant locks this decrements the
+            // hold count; the debug value should remain visible while still held.
             lockMap.unlock(identifier);
 
             if (acquiredAt != null) {
@@ -234,6 +232,16 @@ final class HazelcastReservation implements Reservation {
                 metrics.recordHeldTime(domain, heldTime);
             }
             acquiredAt = null;
+
+            // Remove debug value only after the lock is fully released.
+            // Best-effort: failure here is harmless (value has a TTL anyway).
+            if (!lockMap.isLocked(identifier)) {
+                try {
+                    lockMap.remove(identifier);
+                } catch (Exception e) {
+                    log.debug("Failed to remove debug value for {}: {}", identifier, e.getMessage());
+                }
+            }
 
             log.debug("Unlocked reservation: {}", identifier);
 
