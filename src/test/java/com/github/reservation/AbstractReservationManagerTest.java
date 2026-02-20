@@ -155,6 +155,43 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     @Timeout(10)
+    void lockShouldBlockThenAcquireOnRelease() throws Exception {
+        Reservation holder = manager.getReservation("block-test");
+        holder.lock();
+
+        AtomicBoolean acquired = new AtomicBoolean(false);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        Thread waiter = new Thread(() -> {
+            try {
+                Reservation waiterRes = manager.getReservation("block-test");
+                waiterRes.lock(); // should block
+                acquired.set(true);
+                waiterRes.unlock();
+            } catch (Exception e) {
+                error.set(e);
+            }
+        });
+
+        waiter.start();
+        Thread.sleep(500); // let the waiter block
+
+        // waiter should still be blocking
+        assertThat(acquired.get()).isFalse();
+
+        holder.unlock(); // release so waiter can proceed
+        waiter.join(5000);
+
+        assertThat(error.get())
+            .as("waiter thread should not have thrown")
+            .isNull();
+        assertThat(acquired.get())
+            .as("waiter should have acquired the lock after holder released")
+            .isTrue();
+    }
+
+    @Test
+    @Timeout(10)
     void shouldAllowAcquisitionAfterExpiry() throws Exception {
         ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(1));
         try {
@@ -394,11 +431,4 @@ public abstract class AbstractReservationManagerTest {
             .isInstanceOf(Exception.class);
     }
 
-    // ==================== Builder Validation Tests ====================
-
-    @Test
-    void builderShouldRequireDomain() {
-        // This test validates that building without domain throws
-        // Subclasses can override if they have different requirements
-    }
 }
