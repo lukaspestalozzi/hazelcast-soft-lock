@@ -21,6 +21,9 @@ final class HazelcastReservation implements Reservation {
 
     private static final Logger log = LoggerFactory.getLogger(HazelcastReservation.class);
 
+    /** Poll interval for lockInterruptibly — IMap.lock() is not interruptible. */
+    private static final long INTERRUPTIBLE_POLL_MS = 200;
+
     private final IMap<String, String> lockMap;
     private final String domain;
     private final String identifier;
@@ -108,33 +111,35 @@ final class HazelcastReservation implements Reservation {
 
     @Override
     public void lockInterruptibly() throws InterruptedException {
-        if (Thread.interrupted()) {
-            throw new InterruptedException();
-        }
-
+        // IMap.lock() does NOT respond to thread interrupts, so we poll
+        // via tryLock in a loop, checking interrupt status between attempts.
         Instant start = Instant.now();
         try {
-            // Hazelcast's lock() is interruptible
-            lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-            acquiredAt = Instant.now();
+            while (true) {
+                if (Thread.interrupted()) {
+                    throw new InterruptedException();
+                }
+                if (lockMap.tryLock(identifier, INTERRUPTIBLE_POLL_MS, TimeUnit.MILLISECONDS,
+                        leaseTime.toMillis(), TimeUnit.MILLISECONDS)) {
+                    acquiredAt = Instant.now();
 
-            String value = buildDebugValue();
-            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+                    String value = buildDebugValue();
+                    lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
+                    Duration elapsed = Duration.between(start, Instant.now());
+                    metrics.recordAcquisition(domain, elapsed, "acquired");
+                    metrics.recordAcquisitionAttempt(domain, true);
+
+                    log.debug("Acquired reservation (interruptibly): {}", identifier);
+                    return;
+                }
+            }
+        } catch (InterruptedException e) {
             Duration elapsed = Duration.between(start, Instant.now());
-            metrics.recordAcquisition(domain, elapsed, "acquired");
-            metrics.recordAcquisitionAttempt(domain, true);
-
-            log.debug("Acquired reservation (interruptibly): {}", identifier);
-
+            metrics.recordAcquisition(domain, elapsed, "interrupted");
+            throw e;
         } catch (Exception e) {
             Duration elapsed = Duration.between(start, Instant.now());
-
-            if (e instanceof InterruptedException) {
-                metrics.recordAcquisition(domain, elapsed, "interrupted");
-                throw (InterruptedException) e;
-            }
-
             metrics.recordAcquisition(domain, elapsed, "error");
             metrics.recordAcquisitionAttempt(domain, false);
 
