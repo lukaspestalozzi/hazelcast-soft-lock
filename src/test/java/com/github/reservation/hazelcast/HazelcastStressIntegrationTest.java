@@ -14,6 +14,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Hazelcast stress tests using Testcontainers.
@@ -32,7 +34,7 @@ class HazelcastStressIntegrationTest extends AbstractStressIntegrationTest {
             .withExposedPorts(5701);
 
     private HazelcastInstance client;
-    private String currentMapName;
+    private final Set<String> mapNamesToCleanup = ConcurrentHashMap.newKeySet();
 
     @BeforeAll
     void setupClient() {
@@ -58,7 +60,8 @@ class HazelcastStressIntegrationTest extends AbstractStressIntegrationTest {
 
     @Override
     protected ReservationManager createManager(String domain, Duration leaseTime) {
-        currentMapName = "reservations-" + domain;
+        String mapName = "reservations-" + domain;
+        mapNamesToCleanup.add(mapName);
         return ReservationManager.hazelcast(client)
                 .domain(domain)
                 .leaseTime(leaseTime)
@@ -67,12 +70,15 @@ class HazelcastStressIntegrationTest extends AbstractStressIntegrationTest {
 
     @Override
     protected void cleanup() {
-        if (currentMapName != null && client != null) {
-            try {
-                client.getMap(currentMapName).destroy();
-            } catch (Exception e) {
-                // Ignore cleanup errors
+        if (client != null) {
+            for (String mapName : mapNamesToCleanup) {
+                try {
+                    client.getMap(mapName).destroy();
+                } catch (Exception e) {
+                    // Ignore cleanup errors
+                }
             }
+            mapNamesToCleanup.clear();
         }
     }
 }
