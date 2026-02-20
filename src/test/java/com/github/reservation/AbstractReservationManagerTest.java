@@ -350,17 +350,19 @@ public abstract class AbstractReservationManagerTest {
             });
 
             waiterThread.start();
-            Thread.sleep(200);
+            Thread.sleep(500); // give the thread time to enter lockInterruptibly
             waiterThread.interrupt();
-            waiterThread.join(3000);
+            waiterThread.join(5000);
 
-            // Either the thread was interrupted (exception caught) or it didn't acquire
-            // while the holder still had the lock.
-            if (exception.get() != null) {
-                assertThat(exception.get()).isInstanceOf(InterruptedException.class);
-            } else {
-                assertThat(acquired.get()).isFalse();
-            }
+            // The thread must have received InterruptedException — that is the
+            // entire contract of lockInterruptibly().
+            assertThat(acquired.get())
+                .as("thread should NOT have acquired the lock")
+                .isFalse();
+            assertThat(exception.get())
+                .as("lockInterruptibly must throw InterruptedException on interrupt")
+                .isNotNull()
+                .isInstanceOf(InterruptedException.class);
         } finally {
             holder.unlock();
         }
