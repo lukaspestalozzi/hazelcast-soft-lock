@@ -79,7 +79,12 @@ final class HazelcastReservation implements Reservation {
     @Override
     public void forceUnlock() {
         log.warn("Force unlocking reservation: {}", identifier);
-        lockMap.remove(identifier);
+        try {
+            lockMap.remove(identifier);
+        } catch (Exception e) {
+            log.debug("Failed to remove debug value during forceUnlock for {}: {}",
+                identifier, e.getMessage());
+        }
         lockMap.forceUnlock(identifier);
         acquiredAt = null;
     }
