@@ -85,18 +85,14 @@ final class HazelcastReservation implements Reservation {
     public void lock() {
         Instant start = Instant.now();
         try {
-            // Acquire the Hazelcast lock with lease time
             lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
             acquiredAt = Instant.now();
-
-            // Store debug value
-            String value = buildDebugValue();
-            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             Duration elapsed = Duration.between(start, Instant.now());
             metrics.recordAcquisition(domain, elapsed, "acquired");
             metrics.recordAcquisitionAttempt(domain, true);
 
+            storeDebugValue();
             log.debug("Acquired reservation: {}", identifier);
 
         } catch (Exception e) {
@@ -123,13 +119,11 @@ final class HazelcastReservation implements Reservation {
                         leaseTime.toMillis(), TimeUnit.MILLISECONDS)) {
                     acquiredAt = Instant.now();
 
-                    String value = buildDebugValue();
-                    lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
                     Duration elapsed = Duration.between(start, Instant.now());
                     metrics.recordAcquisition(domain, elapsed, "acquired");
                     metrics.recordAcquisitionAttempt(domain, true);
 
+                    storeDebugValue();
                     log.debug("Acquired reservation (interruptibly): {}", identifier);
                     return;
                 }
@@ -155,18 +149,16 @@ final class HazelcastReservation implements Reservation {
             boolean acquired = lockMap.tryLock(identifier, 0, TimeUnit.MILLISECONDS,
                 leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
+            Duration elapsed = Duration.between(start, Instant.now());
+
             if (acquired) {
                 acquiredAt = Instant.now();
-                String value = buildDebugValue();
-                lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
-                Duration elapsed = Duration.between(start, Instant.now());
                 metrics.recordAcquisition(domain, elapsed, "acquired");
                 metrics.recordAcquisitionAttempt(domain, true);
 
+                storeDebugValue();
                 log.debug("Try-locked reservation: {}", identifier);
             } else {
-                Duration elapsed = Duration.between(start, Instant.now());
                 metrics.recordAcquisition(domain, elapsed, "unavailable");
                 metrics.recordAcquisitionAttempt(domain, false);
 
@@ -199,12 +191,10 @@ final class HazelcastReservation implements Reservation {
 
             if (acquired) {
                 acquiredAt = Instant.now();
-                String value = buildDebugValue();
-                lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
                 metrics.recordAcquisition(domain, elapsed, "acquired");
                 metrics.recordAcquisitionAttempt(domain, true);
 
+                storeDebugValue();
                 log.debug("Try-locked reservation with timeout: {}", identifier);
             } else {
                 metrics.recordAcquisition(domain, elapsed, "timeout");
@@ -247,6 +237,18 @@ final class HazelcastReservation implements Reservation {
             log.warn("Unlock failed for reservation {} - likely expired", identifier);
 
             throw new ReservationExpiredException(domain, identifier);
+        }
+    }
+
+    /**
+     * Stores debug info in the map. Best-effort: failures are logged but do not
+     * affect lock acquisition, preventing a leak if this call throws.
+     */
+    private void storeDebugValue() {
+        try {
+            lockMap.set(identifier, buildDebugValue(), leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.debug("Failed to store debug value for {}: {}", identifier, e.getMessage());
         }
     }
 
