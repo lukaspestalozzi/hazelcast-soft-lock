@@ -118,7 +118,7 @@ Use `scripts/run-maven-with-proxy.sh` to automatically start the proxy and run M
 
 ## Code Conventions
 
-- Exceptions: Use checked exceptions (`ReservationException` hierarchy)
+- Exceptions: Use runtime (unchecked) exceptions (`ReservationException extends RuntimeException`)
 - Domain: Required on manager builder (throws `IllegalStateException` if not set)
 - Key format: Hazelcast uses identifier only (domain isolation via separate maps); Oracle uses `{domain}::{identifier}`
 - Thread safety: Implementations must be thread-safe; use ThreadLocal for ownership tracking
