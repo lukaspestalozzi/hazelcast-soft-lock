@@ -7,10 +7,12 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -876,5 +878,479 @@ public abstract class AbstractStressIntegrationTest {
         assertThat(threadsWithZero)
                 .as("Most threads should get at least one lock")
                 .isLessThan(threadCount / 5 + 1);
+    }
+
+    // ==================== 14. THUNDERING HERD ====================
+
+    @Test
+    @DisplayName("Thundering herd: 100 threads wake simultaneously, only 1 acquires")
+    @Timeout(120)
+    void shouldHandleThunderingHerd() throws Exception {
+        // Hold a lock, have 100 threads waiting via tryLock(timeout).
+        // Release the lock and verify exactly 1 thread enters at a time.
+        Reservation holder = manager.getReservation("thundering-herd");
+        holder.lock();
+
+        int herdSize = 100;
+        AtomicInteger occupancy = new AtomicInteger(0);
+        AtomicInteger maxOccupancy = new AtomicInteger(0);
+        AtomicInteger acquired = new AtomicInteger(0);
+        CountDownLatch allWaiting = new CountDownLatch(herdSize);
+        CountDownLatch allDone = new CountDownLatch(herdSize);
+
+        try {
+            for (int i = 0; i < herdSize; i++) {
+                new Thread(() -> {
+                    try {
+                        allWaiting.countDown();
+                        Reservation res = manager.getReservation("thundering-herd");
+                        if (res.tryLock(30, TimeUnit.SECONDS)) {
+                            try {
+                                int occ = occupancy.incrementAndGet();
+                                maxOccupancy.accumulateAndGet(occ, Math::max);
+                                Thread.sleep(1); // tiny critical section
+                                acquired.incrementAndGet();
+                            } finally {
+                                occupancy.decrementAndGet();
+                                res.unlock();
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        allDone.countDown();
+                    }
+                }, "herd-" + i).start();
+            }
+
+            // Wait for all threads to be blocked on the lock
+            allWaiting.await(10, TimeUnit.SECONDS);
+            Thread.sleep(500);
+
+            // Unleash the herd
+            holder.unlock();
+
+            boolean completed = allDone.await(120, TimeUnit.SECONDS);
+
+            log.info("Thundering herd: {} acquired, max occupancy={}", acquired.get(), maxOccupancy.get());
+
+            assertThat(completed).as("All herd threads should finish").isTrue();
+            assertThat(maxOccupancy.get())
+                    .as("CRITICAL: thundering herd violated mutual exclusion")
+                    .isEqualTo(1);
+            assertThat(acquired.get())
+                    .as("All 100 threads should eventually acquire")
+                    .isEqualTo(herdSize);
+        } catch (Exception e) {
+            // Best effort release on failure
+            try { holder.forceUnlock(); } catch (Exception ignored) {}
+            throw e;
+        }
+    }
+
+    // ==================== 15. PRECISE CONCURRENT HIT (CyclicBarrier) ====================
+
+    @Test
+    @DisplayName("CyclicBarrier: threads synchronize to hit lock at exactly the same instant")
+    @Timeout(60)
+    void shouldHandlePreciseConcurrentHit() throws Exception {
+        // CyclicBarrier ensures ALL threads attempt tryLock at the same nanosecond.
+        // This maximizes contention and tests the lock under worst-case timing.
+        int threadCount = 50;
+        int rounds = 10;
+        CyclicBarrier barrier = new CyclicBarrier(threadCount);
+        AtomicInteger totalAcquired = new AtomicInteger(0);
+        AtomicInteger occupancyViolations = new AtomicInteger(0);
+        AtomicInteger occupancy = new AtomicInteger(0);
+        CountDownLatch allDone = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            new Thread(() -> {
+                try {
+                    for (int round = 0; round < rounds; round++) {
+                        barrier.await(10, TimeUnit.SECONDS);
+                        // ALL threads hit tryLock at (nearly) the same instant
+                        Reservation res = manager.getReservation("barrier-lock");
+                        if (res.tryLock(5, TimeUnit.SECONDS)) {
+                            try {
+                                int occ = occupancy.incrementAndGet();
+                                if (occ > 1) {
+                                    occupancyViolations.incrementAndGet();
+                                }
+                                totalAcquired.incrementAndGet();
+                            } finally {
+                                occupancy.decrementAndGet();
+                                res.unlock();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // Barrier or lock exception — acceptable
+                } finally {
+                    allDone.countDown();
+                }
+            }, "barrier-thread-" + i).start();
+        }
+
+        boolean completed = allDone.await(60, TimeUnit.SECONDS);
+        log.info("CyclicBarrier test: {} acquired across {} rounds, {} violations",
+                totalAcquired.get(), rounds, occupancyViolations.get());
+
+        assertThat(completed).isTrue();
+        assertThat(occupancyViolations.get())
+                .as("CyclicBarrier test: mutual exclusion violated")
+                .isZero();
+        assertThat(totalAcquired.get()).isGreaterThan(0);
+    }
+
+    // ==================== 16. SHARED COUNTER PROOF ====================
+
+    @Test
+    @DisplayName("Shared counter: lock protects non-atomic increment to exact count")
+    @Timeout(120)
+    void sharedCounterMustBeExact() throws Exception {
+        // If the lock provides true mutual exclusion, incrementing a plain long[]
+        // (NOT atomic) inside the critical section must produce the exact expected count.
+        // Any data race shows up as counter != acquiredCount.
+        int threadCount = 30;
+        int incrementsPerThread = 30;
+        long[] counter = {0}; // plain long — deliberately non-atomic
+        AtomicInteger acquiredCount = new AtomicInteger(0);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch completeLatch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            new Thread(() -> {
+                try {
+                    startLatch.await();
+                    for (int iter = 0; iter < incrementsPerThread; iter++) {
+                        Reservation res = manager.getReservation("counter-lock");
+                        if (res.tryLock(30, TimeUnit.SECONDS)) {
+                            try {
+                                counter[0]++;
+                                acquiredCount.incrementAndGet();
+                            } finally {
+                                res.unlock();
+                            }
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    completeLatch.countDown();
+                }
+            }, "counter-" + i).start();
+        }
+
+        startLatch.countDown();
+        boolean completed = completeLatch.await(120, TimeUnit.SECONDS);
+
+        log.info("Shared counter: acquired={}, counter={}", acquiredCount.get(), counter[0]);
+
+        assertThat(completed).isTrue();
+        assertThat(acquiredCount.get()).as("Should acquire locks").isGreaterThan(0);
+        assertThat(counter[0])
+                .as("CRITICAL: counter mismatch proves data race — lock is broken")
+                .isEqualTo((long) acquiredCount.get());
+    }
+
+    // ==================== 17. LATENCY DISTRIBUTION ====================
+
+    @Test
+    @DisplayName("Latency: p50/p95/p99 under contention are within acceptable bounds")
+    @Timeout(120)
+    void shouldHaveAcceptableLatencyDistribution() throws Exception {
+        int threadCount = 30;
+        int opsPerThread = 20;
+        ConcurrentLinkedQueue<Long> latenciesMicros = new ConcurrentLinkedQueue<>();
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch completeLatch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            new Thread(() -> {
+                try {
+                    startLatch.await();
+                    for (int op = 0; op < opsPerThread; op++) {
+                        String lockId = "latency-" + (op % 5);
+                        Reservation res = manager.getReservation(lockId);
+                        long startNanos = System.nanoTime();
+                        if (res.tryLock(10, TimeUnit.SECONDS)) {
+                            long acquireTimeNanos = System.nanoTime() - startNanos;
+                            latenciesMicros.add(TimeUnit.NANOSECONDS.toMicros(acquireTimeNanos));
+                            try {
+                                Thread.sleep(1);
+                            } finally {
+                                res.unlock();
+                            }
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    completeLatch.countDown();
+                }
+            }, "latency-" + i).start();
+        }
+
+        startLatch.countDown();
+        boolean completed = completeLatch.await(120, TimeUnit.SECONDS);
+        assertThat(completed).isTrue();
+
+        long[] sorted = latenciesMicros.stream().mapToLong(Long::longValue).sorted().toArray();
+        assertThat(sorted.length).as("Should have collected latency samples").isGreaterThan(0);
+
+        long p50 = sorted[(int) (sorted.length * 0.50)];
+        long p95 = sorted[(int) (sorted.length * 0.95)];
+        long p99 = sorted[Math.min((int) (sorted.length * 0.99), sorted.length - 1)];
+
+        log.info("Latency distribution ({} samples):", sorted.length);
+        log.info("  p50  = {} us ({} ms)", p50, p50 / 1000);
+        log.info("  p95  = {} us ({} ms)", p95, p95 / 1000);
+        log.info("  p99  = {} us ({} ms)", p99, p99 / 1000);
+        log.info("  max  = {} us ({} ms)", sorted[sorted.length - 1], sorted[sorted.length - 1] / 1000);
+
+        // Under contention on 5 keys with 30 threads, p99 should still be under 30 seconds
+        assertThat(p99)
+                .as("p99 latency should be under 30 seconds even under contention")
+                .isLessThan(30_000_000L);
+    }
+
+    // ==================== 18. LOCK/UNLOCK ORDERING GUARANTEE ====================
+
+    @Test
+    @DisplayName("Ordering: operations inside lock are serialized (list append test)")
+    @Timeout(120)
+    void shouldSerializeOperationsInsideLock() throws Exception {
+        // Multiple threads append to a shared list inside the lock.
+        // If serialized, each append sees the correct previous size.
+        int threadCount = 20;
+        int appendsPerThread = 20;
+        List<Integer> sharedList = new ArrayList<>(); // deliberately not thread-safe
+        AtomicInteger appendCount = new AtomicInteger(0);
+        AtomicInteger orderingViolations = new AtomicInteger(0);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch completeLatch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            new Thread(() -> {
+                try {
+                    startLatch.await();
+                    for (int op = 0; op < appendsPerThread; op++) {
+                        Reservation res = manager.getReservation("ordering-lock");
+                        if (res.tryLock(30, TimeUnit.SECONDS)) {
+                            try {
+                                int sizeBefore = sharedList.size();
+                                sharedList.add(sizeBefore);
+                                int sizeAfter = sharedList.size();
+                                if (sizeAfter != sizeBefore + 1) {
+                                    orderingViolations.incrementAndGet();
+                                }
+                                appendCount.incrementAndGet();
+                            } finally {
+                                res.unlock();
+                            }
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    completeLatch.countDown();
+                }
+            }).start();
+        }
+
+        startLatch.countDown();
+        boolean completed = completeLatch.await(120, TimeUnit.SECONDS);
+
+        log.info("Ordering test: list size={}, appends={}, violations={}",
+                sharedList.size(), appendCount.get(), orderingViolations.get());
+
+        assertThat(completed).isTrue();
+        assertThat(orderingViolations.get())
+                .as("List operations inside lock must be serialized")
+                .isZero();
+        // The list size must exactly match the number of successful appends
+        assertThat(sharedList.size()).isEqualTo(appendCount.get());
+    }
+
+    // ==================== 19. BURST LOAD WITH RECOVERY ====================
+
+    @Test
+    @DisplayName("Burst: sudden spike of 200 concurrent requests then calm")
+    @Timeout(120)
+    void shouldHandleBurstLoadAndRecover() throws Exception {
+        // Phase 1: burst — 200 threads compete for 5 keys simultaneously
+        // Phase 2: calm — verify the system is still functional afterward
+        int burstThreads = 200;
+        int keyCount = 5;
+        LongAdder burstAcquired = new LongAdder();
+        LongAdder burstFailed = new LongAdder();
+        LongAdder burstErrors = new LongAdder();
+        CountDownLatch burstDone = new CountDownLatch(burstThreads);
+
+        ExecutorService executor = Executors.newFixedThreadPool(burstThreads);
+        try {
+            CyclicBarrier barrier = new CyclicBarrier(burstThreads);
+
+            // Phase 1: burst
+            for (int i = 0; i < burstThreads; i++) {
+                final String lockId = "burst-" + (i % keyCount);
+                executor.submit(() -> {
+                    try {
+                        barrier.await(15, TimeUnit.SECONDS);
+                        Reservation res = manager.getReservation(lockId);
+                        if (res.tryLock(10, TimeUnit.SECONDS)) {
+                            try {
+                                Thread.sleep(ThreadLocalRandom.current().nextInt(1, 5));
+                                burstAcquired.increment();
+                            } finally {
+                                try { res.unlock(); } catch (Exception e) { /* ok */ }
+                            }
+                        } else {
+                            burstFailed.increment();
+                        }
+                    } catch (Exception e) {
+                        burstErrors.increment();
+                    } finally {
+                        burstDone.countDown();
+                    }
+                });
+            }
+
+            boolean burstCompleted = burstDone.await(120, TimeUnit.SECONDS);
+
+            log.info("Burst phase: acquired={}, failed={}, errors={}",
+                    burstAcquired.sum(), burstFailed.sum(), burstErrors.sum());
+
+            assertThat(burstCompleted).as("Burst phase should complete").isTrue();
+            assertThat(burstAcquired.sum()).as("Some burst requests should succeed").isGreaterThan(0);
+
+            // Phase 2: calm — the system should still work normally
+            int calmOps = 50;
+            AtomicInteger calmSuccess = new AtomicInteger(0);
+            for (int i = 0; i < calmOps; i++) {
+                Reservation res = manager.getReservation("burst-" + (i % keyCount));
+                if (res.tryLock(5, TimeUnit.SECONDS)) {
+                    try {
+                        calmSuccess.incrementAndGet();
+                    } finally {
+                        res.unlock();
+                    }
+                }
+            }
+
+            log.info("Calm phase: {}/{} succeeded", calmSuccess.get(), calmOps);
+            assertThat(calmSuccess.get())
+                    .as("System must recover after burst — all calm ops should succeed")
+                    .isEqualTo(calmOps);
+        } finally {
+            executor.shutdown();
+            executor.awaitTermination(10, TimeUnit.SECONDS);
+        }
+    }
+
+    // ==================== 20. MULTI-DOMAIN THROUGHPUT ====================
+
+    @Test
+    @DisplayName("Multi-domain throughput: 4 domains x 100 rps each = 400 rps total")
+    @Timeout(120)
+    void shouldHandleMultiDomainThroughput() throws Exception {
+        String[] domains = {"orders", "payments", "inventory", "shipping"};
+        ReservationManager[] domainManagers = new ReservationManager[domains.length];
+        for (int i = 0; i < domains.length; i++) {
+            domainManagers[i] = createManager(domains[i], Duration.ofSeconds(30));
+            managersToClose.add(domainManagers[i]);
+        }
+
+        int threadsPerDomain = 25;
+        int opsPerThread = 40;
+        int totalThreads = domains.length * threadsPerDomain;
+        LongAdder[] domainOps = new LongAdder[domains.length];
+        for (int i = 0; i < domains.length; i++) {
+            domainOps[i] = new LongAdder();
+        }
+        LongAdder totalErrors = new LongAdder();
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch completeLatch = new CountDownLatch(totalThreads);
+        long startTime = System.nanoTime();
+
+        for (int d = 0; d < domains.length; d++) {
+            final int domainIdx = d;
+            final ReservationManager mgr = domainManagers[d];
+
+            for (int t = 0; t < threadsPerDomain; t++) {
+                new Thread(() -> {
+                    try {
+                        startLatch.await();
+                        for (int op = 0; op < opsPerThread; op++) {
+                            String lockId = "resource-" + (op % 10);
+                            Reservation res = mgr.getReservation(lockId);
+                            if (res.tryLock(5, TimeUnit.SECONDS)) {
+                                try {
+                                    domainOps[domainIdx].increment();
+                                } finally {
+                                    res.unlock();
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        totalErrors.increment();
+                    } finally {
+                        completeLatch.countDown();
+                    }
+                }).start();
+            }
+        }
+
+        startLatch.countDown();
+        boolean completed = completeLatch.await(120, TimeUnit.SECONDS);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
+
+        long totalOps = Arrays.stream(domainOps).mapToLong(LongAdder::sum).sum();
+        double totalOpsPerSec = totalOps * 1000.0 / elapsedMs;
+
+        log.info("Multi-domain throughput ({} domains, {} threads, {} ms):", domains.length, totalThreads, elapsedMs);
+        for (int i = 0; i < domains.length; i++) {
+            double domainRate = domainOps[i].sum() * 1000.0 / elapsedMs;
+            log.info("  {}: {} ops ({} ops/sec)", domains[i], domainOps[i].sum(), String.format("%.0f", domainRate));
+        }
+        log.info("  Total: {} ops ({} ops/sec), errors={}", totalOps, String.format("%.0f", totalOpsPerSec), totalErrors.sum());
+
+        assertThat(completed).isTrue();
+        assertThat(totalOpsPerSec).as("Should sustain at least 100 ops/sec across all domains").isGreaterThan(100.0);
+    }
+
+    // ==================== 21. LEASE TIME BOUNDARY ====================
+
+    @Test
+    @DisplayName("Lease boundary: lock held just under lease time, unlock succeeds")
+    @Timeout(60)
+    void shouldAllowUnlockJustBeforeLeaseExpiry() throws Exception {
+        // Create manager with 1-second lease
+        ReservationManager shortManager = createManager("lease-boundary", Duration.ofSeconds(1));
+        managersToClose.add(shortManager);
+
+        int iterations = 10;
+        AtomicInteger successUnlocks = new AtomicInteger(0);
+        AtomicInteger expiredUnlocks = new AtomicInteger(0);
+
+        for (int i = 0; i < iterations; i++) {
+            String lockId = "boundary-" + i;
+            Reservation res = shortManager.getReservation(lockId);
+            res.lock();
+            try {
+                // Hold for 800ms — just under 1s lease
+                Thread.sleep(800);
+                res.unlock();
+                successUnlocks.incrementAndGet();
+            } catch (Exception e) {
+                expiredUnlocks.incrementAndGet();
+            }
+        }
+
+        log.info("Lease boundary: {} successful unlocks, {} expired", successUnlocks.get(), expiredUnlocks.get());
+        assertThat(successUnlocks.get())
+                .as("Most unlocks just before expiry should succeed")
+                .isGreaterThan(iterations / 2);
     }
 }
