@@ -44,6 +44,21 @@ public abstract class AbstractStressIntegrationTest {
      */
     protected abstract void cleanup();
 
+    // ==================== Configurable parameters ====================
+    // Subclasses can override to reduce load for slower backends (e.g. Testcontainers).
+
+    /** Thread count for tests with high thread counts (thundering herd, burst). */
+    protected int highThreadCount() { return 100; }
+
+    /** Thread count for medium-load tests (mutual exclusion, throughput). */
+    protected int mediumThreadCount() { return 50; }
+
+    /** Thread count for burst test (very high). */
+    protected int burstThreadCount() { return 200; }
+
+    /** Default tryLock timeout for contended tests. */
+    protected int tryLockTimeoutSeconds() { return 30; }
+
     @BeforeEach
     void setUp() {
         manager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(30));
@@ -70,7 +85,7 @@ public abstract class AbstractStressIntegrationTest {
         // This is the fundamental correctness property of any lock.
         // We use an AtomicInteger as occupancy counter: if it ever exceeds 1,
         // two threads were inside the critical section at the same time.
-        int threadCount = 50;
+        int threadCount = mediumThreadCount();
         int iterationsPerThread = 20;
         AtomicInteger occupancy = new AtomicInteger(0);
         AtomicInteger maxObservedOccupancy = new AtomicInteger(0);
@@ -133,8 +148,8 @@ public abstract class AbstractStressIntegrationTest {
     @Timeout(120)
     void shouldSustainHighThroughput() throws Exception {
         // Simulate 100 rps by spreading requests across 20 lock keys
-        // (to avoid pure serial bottleneck) with 50 concurrent threads.
-        int threadCount = 50;
+        // (to avoid pure serial bottleneck) with concurrent threads.
+        int threadCount = mediumThreadCount();
         int lockKeyCount = 20;
         int targetOps = 2000;
         AtomicInteger totalOps = new AtomicInteger(0);
@@ -195,7 +210,7 @@ public abstract class AbstractStressIntegrationTest {
     @DisplayName("High contention: 50 threads competing for single lock")
     @Timeout(120)
     void shouldHandleHighContention() throws Exception {
-        int threadCount = 50;
+        int threadCount = mediumThreadCount();
         int iterationsPerThread = 10;
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger failureCount = new AtomicInteger(0);
@@ -763,7 +778,7 @@ public abstract class AbstractStressIntegrationTest {
         int keyCount = 10;
 
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
-        ExecutorService workers = Executors.newFixedThreadPool(50);
+        ExecutorService workers = Executors.newFixedThreadPool(mediumThreadCount());
 
         AtomicInteger submitted = new AtomicInteger(0);
         AtomicInteger completed = new AtomicInteger(0);
@@ -883,7 +898,7 @@ public abstract class AbstractStressIntegrationTest {
     // ==================== 14. THUNDERING HERD ====================
 
     @Test
-    @DisplayName("Thundering herd: 100 threads wake simultaneously, only 1 acquires")
+    @DisplayName("Thundering herd: many threads wake simultaneously, only 1 acquires")
     @Timeout(120)
     void shouldHandleThunderingHerd() throws Exception {
         // Hold a lock, have 100 threads waiting via tryLock(timeout).
@@ -891,7 +906,7 @@ public abstract class AbstractStressIntegrationTest {
         Reservation holder = manager.getReservation("thundering-herd");
         holder.lock();
 
-        int herdSize = 100;
+        int herdSize = highThreadCount();
         AtomicInteger occupancy = new AtomicInteger(0);
         AtomicInteger maxOccupancy = new AtomicInteger(0);
         AtomicInteger acquired = new AtomicInteger(0);
@@ -904,7 +919,7 @@ public abstract class AbstractStressIntegrationTest {
                     try {
                         allWaiting.countDown();
                         Reservation res = manager.getReservation("thundering-herd");
-                        if (res.tryLock(30, TimeUnit.SECONDS)) {
+                        if (res.tryLock(tryLockTimeoutSeconds(), TimeUnit.SECONDS)) {
                             try {
                                 int occ = occupancy.incrementAndGet();
                                 maxOccupancy.accumulateAndGet(occ, Math::max);
@@ -939,7 +954,7 @@ public abstract class AbstractStressIntegrationTest {
                     .as("CRITICAL: thundering herd violated mutual exclusion")
                     .isEqualTo(1);
             assertThat(acquired.get())
-                    .as("All 100 threads should eventually acquire")
+                    .as("All herd threads should eventually acquire")
                     .isEqualTo(herdSize);
         } catch (Exception e) {
             // Best effort release on failure
@@ -956,7 +971,7 @@ public abstract class AbstractStressIntegrationTest {
     void shouldHandlePreciseConcurrentHit() throws Exception {
         // CyclicBarrier ensures ALL threads attempt tryLock at the same nanosecond.
         // This maximizes contention and tests the lock under worst-case timing.
-        int threadCount = 50;
+        int threadCount = mediumThreadCount();
         int rounds = 10;
         CyclicBarrier barrier = new CyclicBarrier(threadCount);
         AtomicInteger totalAcquired = new AtomicInteger(0);
@@ -1025,7 +1040,7 @@ public abstract class AbstractStressIntegrationTest {
                     startLatch.await();
                     for (int iter = 0; iter < incrementsPerThread; iter++) {
                         Reservation res = manager.getReservation("counter-lock");
-                        if (res.tryLock(30, TimeUnit.SECONDS)) {
+                        if (res.tryLock(tryLockTimeoutSeconds(), TimeUnit.SECONDS)) {
                             try {
                                 counter[0]++;
                                 acquiredCount.incrementAndGet();
@@ -1137,7 +1152,7 @@ public abstract class AbstractStressIntegrationTest {
                     startLatch.await();
                     for (int op = 0; op < appendsPerThread; op++) {
                         Reservation res = manager.getReservation("ordering-lock");
-                        if (res.tryLock(30, TimeUnit.SECONDS)) {
+                        if (res.tryLock(tryLockTimeoutSeconds(), TimeUnit.SECONDS)) {
                             try {
                                 int sizeBefore = sharedList.size();
                                 sharedList.add(sizeBefore);
@@ -1176,12 +1191,12 @@ public abstract class AbstractStressIntegrationTest {
     // ==================== 19. BURST LOAD WITH RECOVERY ====================
 
     @Test
-    @DisplayName("Burst: sudden spike of 200 concurrent requests then calm")
+    @DisplayName("Burst: sudden spike of concurrent requests then calm")
     @Timeout(120)
     void shouldHandleBurstLoadAndRecover() throws Exception {
-        // Phase 1: burst — 200 threads compete for 5 keys simultaneously
+        // Phase 1: burst — many threads compete for 5 keys simultaneously
         // Phase 2: calm — verify the system is still functional afterward
-        int burstThreads = 200;
+        int burstThreads = burstThreadCount();
         int keyCount = 5;
         LongAdder burstAcquired = new LongAdder();
         LongAdder burstFailed = new LongAdder();
@@ -1262,7 +1277,7 @@ public abstract class AbstractStressIntegrationTest {
             managersToClose.add(domainManagers[i]);
         }
 
-        int threadsPerDomain = 25;
+        int threadsPerDomain = mediumThreadCount() / 2;
         int opsPerThread = 40;
         int totalThreads = domains.length * threadsPerDomain;
         LongAdder[] domainOps = new LongAdder[domains.length];
