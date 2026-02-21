@@ -155,6 +155,43 @@ public abstract class AbstractReservationManagerTest {
 
     @Test
     @Timeout(10)
+    void lockShouldBlockThenAcquireOnRelease() throws Exception {
+        Reservation holder = manager.getReservation("block-test");
+        holder.lock();
+
+        AtomicBoolean acquired = new AtomicBoolean(false);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        Thread waiter = new Thread(() -> {
+            try {
+                Reservation waiterRes = manager.getReservation("block-test");
+                waiterRes.lock(); // should block
+                acquired.set(true);
+                waiterRes.unlock();
+            } catch (Exception e) {
+                error.set(e);
+            }
+        });
+
+        waiter.start();
+        Thread.sleep(500); // let the waiter block
+
+        // waiter should still be blocking
+        assertThat(acquired.get()).isFalse();
+
+        holder.unlock(); // release so waiter can proceed
+        waiter.join(5000);
+
+        assertThat(error.get())
+            .as("waiter thread should not have thrown")
+            .isNull();
+        assertThat(acquired.get())
+            .as("waiter should have acquired the lock after holder released")
+            .isTrue();
+    }
+
+    @Test
+    @Timeout(10)
     void shouldAllowAcquisitionAfterExpiry() throws Exception {
         ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(1));
         try {
@@ -350,17 +387,19 @@ public abstract class AbstractReservationManagerTest {
             });
 
             waiterThread.start();
-            Thread.sleep(200);
+            Thread.sleep(500); // give the thread time to enter lockInterruptibly
             waiterThread.interrupt();
-            waiterThread.join(3000);
+            waiterThread.join(5000);
 
-            // Either the thread was interrupted (exception caught) or it didn't acquire
-            // while the holder still had the lock.
-            if (exception.get() != null) {
-                assertThat(exception.get()).isInstanceOf(InterruptedException.class);
-            } else {
-                assertThat(acquired.get()).isFalse();
-            }
+            // The thread must have received InterruptedException — that is the
+            // entire contract of lockInterruptibly().
+            assertThat(acquired.get())
+                .as("thread should NOT have acquired the lock")
+                .isFalse();
+            assertThat(exception.get())
+                .as("lockInterruptibly must throw InterruptedException on interrupt")
+                .isNotNull()
+                .isInstanceOf(InterruptedException.class);
         } finally {
             holder.unlock();
         }
@@ -392,11 +431,4 @@ public abstract class AbstractReservationManagerTest {
             .isInstanceOf(Exception.class);
     }
 
-    // ==================== Builder Validation Tests ====================
-
-    @Test
-    void builderShouldRequireDomain() {
-        // This test validates that building without domain throws
-        // Subclasses can override if they have different requirements
-    }
 }

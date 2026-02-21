@@ -8,7 +8,9 @@ import com.hazelcast.core.HazelcastInstance;
 import org.junit.jupiter.api.*;
 
 import java.time.Duration;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -20,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
 
     private static HazelcastInstance hazelcast;
+    private final Set<String> mapNamesToCleanup = ConcurrentHashMap.newKeySet();
     private String currentMapName;
 
     @BeforeAll
@@ -44,6 +47,7 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
         // Use unique map prefix to avoid conflicts between tests
         String mapPrefix = "test-reservations-" + UUID.randomUUID().toString().substring(0, 8);
         currentMapName = mapPrefix + "-" + domain;
+        mapNamesToCleanup.add(currentMapName);
         return ReservationManager.hazelcast(hazelcast)
             .domain(domain)
             .leaseTime(leaseTime)
@@ -53,12 +57,15 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
 
     @Override
     protected void cleanup() {
-        if (currentMapName != null && hazelcast != null) {
-            try {
-                hazelcast.getMap(currentMapName).destroy();
-            } catch (Exception e) {
-                // Ignore cleanup errors
+        if (hazelcast != null) {
+            for (String mapName : mapNamesToCleanup) {
+                try {
+                    hazelcast.getMap(mapName).destroy();
+                } catch (Exception e) {
+                    // Ignore cleanup errors
+                }
             }
+            mapNamesToCleanup.clear();
         }
     }
 
@@ -87,13 +94,16 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
     @Test
     void shouldUseDomainBasedMapName() {
         String domain = "test-domain-" + UUID.randomUUID().toString().substring(0, 8);
+        String expectedMapName = "reservations-" + domain;
+        mapNamesToCleanup.add(expectedMapName);
+
         ReservationManager domainManager = ReservationManager.hazelcast(hazelcast)
             .domain(domain)
             .build();
 
         try {
             HazelcastReservationManager hzManager = (HazelcastReservationManager) domainManager;
-            assertThat(hzManager.getMapName()).isEqualTo("reservations-" + domain);
+            assertThat(hzManager.getMapName()).isEqualTo(expectedMapName);
             assertThat(hzManager.getDomain()).isEqualTo(domain);
         } finally {
             domainManager.close();
@@ -104,6 +114,8 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
     void shouldIsolateBetweenDomains() {
         String domain1 = "domain1-" + UUID.randomUUID().toString().substring(0, 8);
         String domain2 = "domain2-" + UUID.randomUUID().toString().substring(0, 8);
+        mapNamesToCleanup.add("reservations-" + domain1);
+        mapNamesToCleanup.add("reservations-" + domain2);
 
         ReservationManager manager1 = ReservationManager.hazelcast(hazelcast)
             .domain(domain1)
@@ -126,8 +138,6 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
         } finally {
             manager1.close();
             manager2.close();
-            hazelcast.getMap("reservations-" + domain1).destroy();
-            hazelcast.getMap("reservations-" + domain2).destroy();
         }
     }
 

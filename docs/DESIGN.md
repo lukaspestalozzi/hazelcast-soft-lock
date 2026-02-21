@@ -2,7 +2,7 @@
 
 > **Version**: 1.0.0-SNAPSHOT
 > **Status**: Draft
-> **Last Updated**: 2025-12-31
+> **Last Updated**: 2026-02-20
 
 ---
 
@@ -46,7 +46,7 @@ Both implementations share the same API and behavioral guarantees.
 - **Domain isolation**: Hazelcast uses separate IMaps per domain; Oracle uses composite keys
 - Micrometer metrics integration for observability
 - Reentrant locking support
-- Checked exceptions for explicit error handling
+- Runtime (unchecked) exceptions for clean Lock interface compliance
 - Shared test suite validating both implementations
 
 ### 1.3 Design Decisions Summary
@@ -63,7 +63,7 @@ Both implementations share the same API and behavioral guarantees.
 | Lease time config | Global default on manager | Simplicity with configurability |
 | Thread affinity | Strict (per-thread ownership) | Consistency with Lock contract |
 | Reentrancy | Supported | Same thread can lock multiple times |
-| Error handling | Checked exceptions | Explicit failure handling |
+| Error handling | Runtime (unchecked) exceptions | Clean Lock interface compliance |
 | Project structure | Single module | Simpler build, single artifact |
 | Testing | Abstract base test class | Shared tests for both implementations |
 | Hazelcast value | String with debug info | Debuggability with low overhead |
@@ -134,7 +134,7 @@ Both implementations share the same API and behavioral guarantees.
 | `HazelcastReservationManager` | Hazelcast-backed implementation (uses domain-specific IMap) |
 | `OracleReservationManager` | Oracle-backed implementation (uses composite keys) |
 | `LockingStrategy` | Pluggable Oracle locking mechanism (Strategy pattern) |
-| `ReservationMetrics` | Micrometer metrics registration and recording |
+| `ReservationMetrics` | Metrics interface (no-op or Micrometer-backed, auto-detected) |
 
 ### 2.3 Reservation Lifecycle
 
@@ -427,7 +427,7 @@ package com.github.reservation;
 /**
  * Base exception for all reservation-related errors.
  */
-public class ReservationException extends Exception {
+public class ReservationException extends RuntimeException {
     public ReservationException(String message) { super(message); }
     public ReservationException(String message, Throwable cause) { super(message, cause); }
 }
@@ -494,7 +494,6 @@ public class InvalidReservationKeyException extends IllegalArgumentException {
 ```java
 package com.github.reservation;
 
-import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -505,7 +504,8 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
 
     protected String domain;  // Required
     protected Duration leaseTime = Duration.ofMinutes(1);
-    protected MeterRegistry meterRegistry = null;
+    /** Stored as Object to avoid hard dependency on Micrometer at class-load time. */
+    protected Object meterRegistry = null;
 
     /**
      * Sets the domain for this manager. Required.
@@ -539,10 +539,12 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
     }
 
     /**
-     * Sets the Micrometer registry for metrics. Default: none (metrics disabled)
+     * Sets the Micrometer registry for metrics. Default: none (metrics disabled).
+     * Pass a MeterRegistry instance; if Micrometer is not on the classpath,
+     * this setting is silently ignored.
      */
     @SuppressWarnings("unchecked")
-    public T meterRegistry(MeterRegistry meterRegistry) {
+    public T meterRegistry(Object meterRegistry) {
         this.meterRegistry = meterRegistry;
         return (T) this;
     }
@@ -714,30 +716,17 @@ Values are stored as simple key-value strings for debugging:
 holder=thread-123@host-abc,acquired=2025-01-01T12:00:00.000Z
 ```
 
-Implementation:
+The debug value is built by a private method in `HazelcastReservation`. The hostname is cached
+in a static field to avoid DNS lookups on every lock operation. The debug write is best-effort:
+if it fails, the lock acquisition still succeeds.
 
 ```java
-/**
- * Builds the debug value stored in the IMap.
- */
-final class ReservationValueBuilder {
+/** Cached hostname — InetAddress.getLocalHost() can trigger DNS lookups. */
+private static final String HOST_NAME = resolveHostName();
 
-    static String buildValue() {
-        String threadName = Thread.currentThread().getName();
-        String hostName = getHostName();
-        Instant acquired = Instant.now();
-
-        return String.format("holder=%s@%s,acquired=%s",
-            threadName, hostName, acquired.toString());
-    }
-
-    private static String getHostName() {
-        try {
-            return InetAddress.getLocalHost().getHostName();
-        } catch (UnknownHostException e) {
-            return "unknown";
-        }
-    }
+private String buildDebugValue() {
+    return String.format("holder=%s@%s,acquired=%s",
+        Thread.currentThread().getName(), HOST_NAME, Instant.now());
 }
 ```
 
@@ -750,54 +739,58 @@ class HazelcastReservation implements Reservation {
     private final String domain;        // For metrics/logging
     private final String identifier;    // Key in the map
     private final Duration leaseTime;
+    private volatile Instant acquiredAt;
 
     @Override
     public void lock() throws ReservationAcquisitionException {
+        Instant start = Instant.now();
         try {
-            // First acquire the Hazelcast lock (key = identifier only)
             lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
-            // Then store debug value
-            String value = buildDebugValue();
-            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
+            recordAcquired(start); // sets acquiredAt, records metrics, stores debug value (best-effort)
         } catch (Exception e) {
+            recordFailure(start, "error");
             throw new ReservationAcquisitionException(domain, identifier,
                 "Failed to acquire reservation", e);
         }
     }
 
     @Override
-    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
-        boolean acquired = lockMap.tryLock(
-            identifier,
-            time, unit,                                    // wait time
-            leaseTime.toMillis(), TimeUnit.MILLISECONDS    // lease time
-        );
-
-        if (acquired) {
-            String value = buildDebugValue();
-            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+    public void lockInterruptibly() throws InterruptedException {
+        // IMap.lock() does NOT respond to interrupts, so we poll via tryLock
+        Instant start = Instant.now();
+        while (true) {
+            if (Thread.interrupted()) throw new InterruptedException();
+            if (lockMap.tryLock(identifier, 200, TimeUnit.MILLISECONDS,
+                    leaseTime.toMillis(), TimeUnit.MILLISECONDS)) {
+                recordAcquired(start);
+                return;
+            }
         }
-
-        return acquired;
     }
 
     @Override
     public void unlock() throws ReservationExpiredException {
         try {
-            lockMap.remove(identifier);  // Clean up debug value
+            // Release first; for reentrant locks this decrements hold count.
             lockMap.unlock(identifier);
+
+            // Record held time metrics...
+            acquiredAt = null;
+
+            // Remove debug value only when fully released (best-effort).
+            if (!lockMap.isLocked(identifier)) {
+                try { lockMap.remove(identifier); } catch (Exception e) { /* ignore */ }
+            }
         } catch (IllegalMonitorStateException e) {
-            // Lock expired or not owned
             throw new ReservationExpiredException(domain, identifier);
         }
     }
 
     @Override
     public void forceUnlock() {
-        lockMap.remove(identifier);
+        try { lockMap.remove(identifier); } catch (Exception e) { /* best-effort */ }
         lockMap.forceUnlock(identifier);
+        acquiredAt = null;
     }
 
     @Override
@@ -1261,7 +1254,8 @@ ReservationManager manager = ReservationManager.oracle(dataSource)
 
 ### 7.1 Exception Strategy
 
-All public API methods use **checked exceptions** to force explicit handling:
+All custom exceptions extend `RuntimeException` (unchecked) to comply with the
+`java.util.concurrent.locks.Lock` interface, which does not allow checked exceptions on `lock()`:
 
 | Method | Throws | Reason |
 |--------|--------|--------|
@@ -1294,7 +1288,6 @@ All public API methods use **checked exceptions** to force explicit handling:
 | `reservation.acquire.attempts` | Counter | `domain`, `backend`, `result` | Acquisition attempts |
 | `reservation.held.time` | Timer | `domain`, `backend` | Duration reservation was held |
 | `reservation.expired` | Counter | `domain`, `backend` | Reservations expired before unlock |
-| `reservation.active` | Gauge | `domain`, `backend` | Currently held reservations (approximate) |
 
 ### 8.2 Metric Tags
 
@@ -1304,35 +1297,22 @@ All public API methods use **checked exceptions** to force explicit handling:
 
 ### 8.3 Metrics Implementation
 
+`ReservationMetrics` is an interface with a factory method that detects Micrometer
+at runtime via `Class.forName()`. When Micrometer is absent, a no-op implementation
+is used, so the library works without Micrometer on the classpath.
+
 ```java
-class ReservationMetrics {
-    private final MeterRegistry registry;
-    private final String backend;
+public interface ReservationMetrics {
+    void recordAcquisition(String domain, Duration elapsed, String result);
+    void recordAcquisitionAttempt(String domain, boolean success);
+    void recordHeldTime(String domain, Duration elapsed);
+    void recordExpiration(String domain);
 
-    ReservationMetrics(MeterRegistry registry, String backend) {
-        this.registry = registry;
-        this.backend = backend;
-    }
-
-    void recordAcquisition(String domain, Duration elapsed, String result) {
-        if (registry == null) return;
-
-        Timer.builder("reservation.acquire")
-            .tag("domain", domain)
-            .tag("backend", backend)
-            .tag("result", result)
-            .register(registry)
-            .record(elapsed);
-    }
-
-    void recordExpiration(String domain) {
-        if (registry == null) return;
-
-        Counter.builder("reservation.expired")
-            .tag("domain", domain)
-            .tag("backend", backend)
-            .register(registry)
-            .increment();
+    static ReservationMetrics create(Object meterRegistry, String backend) {
+        if (meterRegistry == null || !isMicrometerAvailable()) {
+            return NoOpReservationMetrics.INSTANCE;
+        }
+        return new MicrometerReservationMetrics(meterRegistry, backend);
     }
 }
 ```
@@ -1887,31 +1867,33 @@ reservation-lock/
 │   │                   ├── hazelcast/
 │   │                   │   ├── HazelcastReservationManager.java
 │   │                   │   ├── HazelcastReservation.java
-│   │                   │   └── ReservationValueBuilder.java
+│   │                   │   └── HazelcastReservationManagerBuilder.java
 │   │                   ├── oracle/
 │   │                   │   ├── OracleReservationManager.java
 │   │                   │   ├── OracleReservation.java
+│   │                   │   ├── OracleReservationManagerBuilder.java
 │   │                   │   ├── LockingStrategy.java            # Strategy interface
 │   │                   │   ├── LockingException.java
 │   │                   │   └── TableBasedLockingStrategy.java  # Default impl
 │   │                   └── internal/
 │   │                       ├── ReservationKeyBuilder.java
-│   │                       └── ReservationMetrics.java
+│   │                       ├── ReservationMetrics.java         # Interface + factory
+│   │                       ├── MicrometerReservationMetrics.java
+│   │                       └── NoOpReservationMetrics.java
 │   └── test/
 │       └── java/
 │           └── com/
 │               └── github/
 │                   └── reservation/
 │                       ├── AbstractReservationManagerTest.java  # Shared tests
+│                       ├── AbstractStressIntegrationTest.java   # Shared stress tests
 │                       ├── ReservationKeyBuilderTest.java
 │                       ├── hazelcast/
 │                       │   ├── HazelcastReservationManagerTest.java
-│                       │   └── HazelcastIntegrationTest.java
-│                       ├── oracle/
-│                       │   ├── OracleReservationManagerTest.java
-│                       │   └── TableBasedLockingStrategyTest.java
-│                       └── benchmark/
-│                           └── ReservationBenchmark.java
+│                       │   └── HazelcastStressIntegrationTest.java
+│                       └── oracle/
+│                           ├── JdbcReservationManagerTest.java
+│                           └── JdbcStressIntegrationTest.java
 ```
 
 ---

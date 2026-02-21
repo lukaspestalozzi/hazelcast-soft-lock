@@ -21,6 +21,12 @@ final class HazelcastReservation implements Reservation {
 
     private static final Logger log = LoggerFactory.getLogger(HazelcastReservation.class);
 
+    /** Poll interval for lockInterruptibly — IMap.lock() is not interruptible. */
+    private static final long INTERRUPTIBLE_POLL_MS = 200;
+
+    /** Cached hostname — InetAddress.getLocalHost() can trigger DNS lookups. */
+    private static final String HOST_NAME = resolveHostName();
+
     private final IMap<String, String> lockMap;
     private final String domain;
     private final String identifier;
@@ -50,8 +56,6 @@ final class HazelcastReservation implements Reservation {
 
     @Override
     public String getReservationKey() {
-        // In single-domain mode, the key is just the identifier
-        // (the domain isolation is handled by using separate maps)
         return identifier;
     }
 
@@ -73,7 +77,12 @@ final class HazelcastReservation implements Reservation {
     @Override
     public void forceUnlock() {
         log.warn("Force unlocking reservation: {}", identifier);
-        lockMap.remove(identifier);
+        try {
+            lockMap.remove(identifier);
+        } catch (Exception e) {
+            log.debug("Failed to remove debug value during forceUnlock for {}: {}",
+                identifier, e.getMessage());
+        }
         lockMap.forceUnlock(identifier);
         acquiredAt = null;
     }
@@ -82,25 +91,10 @@ final class HazelcastReservation implements Reservation {
     public void lock() {
         Instant start = Instant.now();
         try {
-            // Acquire the Hazelcast lock with lease time
             lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-            acquiredAt = Instant.now();
-
-            // Store debug value
-            String value = buildDebugValue();
-            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
-            Duration elapsed = Duration.between(start, Instant.now());
-            metrics.recordAcquisition(domain, elapsed, "acquired");
-            metrics.recordAcquisitionAttempt(domain, true);
-
-            log.debug("Acquired reservation: {}", identifier);
-
+            recordAcquired(start);
         } catch (Exception e) {
-            Duration elapsed = Duration.between(start, Instant.now());
-            metrics.recordAcquisition(domain, elapsed, "error");
-            metrics.recordAcquisitionAttempt(domain, false);
-
+            recordFailure(start, "error");
             throw new ReservationAcquisitionException(domain, identifier,
                 "Failed to acquire reservation", e);
         }
@@ -108,36 +102,26 @@ final class HazelcastReservation implements Reservation {
 
     @Override
     public void lockInterruptibly() throws InterruptedException {
-        if (Thread.interrupted()) {
-            throw new InterruptedException();
-        }
-
+        // IMap.lock() does NOT respond to thread interrupts, so we poll
+        // via tryLock in a loop, checking interrupt status between attempts.
         Instant start = Instant.now();
         try {
-            // Hazelcast's lock() is interruptible
-            lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-            acquiredAt = Instant.now();
-
-            String value = buildDebugValue();
-            lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
-            Duration elapsed = Duration.between(start, Instant.now());
-            metrics.recordAcquisition(domain, elapsed, "acquired");
-            metrics.recordAcquisitionAttempt(domain, true);
-
-            log.debug("Acquired reservation (interruptibly): {}", identifier);
-
-        } catch (Exception e) {
-            Duration elapsed = Duration.between(start, Instant.now());
-
-            if (e instanceof InterruptedException) {
-                metrics.recordAcquisition(domain, elapsed, "interrupted");
-                throw (InterruptedException) e;
+            while (true) {
+                if (Thread.interrupted()) {
+                    throw new InterruptedException();
+                }
+                if (lockMap.tryLock(identifier, INTERRUPTIBLE_POLL_MS, TimeUnit.MILLISECONDS,
+                        leaseTime.toMillis(), TimeUnit.MILLISECONDS)) {
+                    recordAcquired(start);
+                    return;
+                }
             }
-
-            metrics.recordAcquisition(domain, elapsed, "error");
-            metrics.recordAcquisitionAttempt(domain, false);
-
+        } catch (InterruptedException e) {
+            Duration elapsed = Duration.between(start, Instant.now());
+            metrics.recordAcquisition(domain, elapsed, "interrupted");
+            throw e;
+        } catch (Exception e) {
+            recordFailure(start, "error");
             throw new ReservationAcquisitionException(domain, identifier,
                 "Failed to acquire reservation", e);
         }
@@ -151,23 +135,10 @@ final class HazelcastReservation implements Reservation {
                 leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
             if (acquired) {
-                acquiredAt = Instant.now();
-                String value = buildDebugValue();
-                lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
-                Duration elapsed = Duration.between(start, Instant.now());
-                metrics.recordAcquisition(domain, elapsed, "acquired");
-                metrics.recordAcquisitionAttempt(domain, true);
-
-                log.debug("Try-locked reservation: {}", identifier);
+                recordAcquired(start);
             } else {
-                Duration elapsed = Duration.between(start, Instant.now());
-                metrics.recordAcquisition(domain, elapsed, "unavailable");
-                metrics.recordAcquisitionAttempt(domain, false);
-
-                log.debug("Try-lock failed, reservation unavailable: {}", identifier);
+                recordFailure(start, "unavailable");
             }
-
             return acquired;
 
         } catch (InterruptedException e) {
@@ -190,24 +161,11 @@ final class HazelcastReservation implements Reservation {
             boolean acquired = lockMap.tryLock(identifier, time, unit,
                 leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
-            Duration elapsed = Duration.between(start, Instant.now());
-
             if (acquired) {
-                acquiredAt = Instant.now();
-                String value = buildDebugValue();
-                lockMap.set(identifier, value, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
-
-                metrics.recordAcquisition(domain, elapsed, "acquired");
-                metrics.recordAcquisitionAttempt(domain, true);
-
-                log.debug("Try-locked reservation with timeout: {}", identifier);
+                recordAcquired(start);
             } else {
-                metrics.recordAcquisition(domain, elapsed, "timeout");
-                metrics.recordAcquisitionAttempt(domain, false);
-
-                log.debug("Try-lock timed out for reservation: {}", identifier);
+                recordFailure(start, "timeout");
             }
-
             return acquired;
 
         } catch (InterruptedException e) {
@@ -220,10 +178,8 @@ final class HazelcastReservation implements Reservation {
     @Override
     public void unlock() {
         try {
-            // Remove the debug value first
-            lockMap.remove(identifier);
-
-            // Then release the lock
+            // Release the lock first. For reentrant locks this decrements the
+            // hold count; the debug value should remain visible while still held.
             lockMap.unlock(identifier);
 
             if (acquiredAt != null) {
@@ -231,6 +187,12 @@ final class HazelcastReservation implements Reservation {
                 metrics.recordHeldTime(domain, heldTime);
             }
             acquiredAt = null;
+
+            // Remove debug value only after the lock is fully released.
+            // Best-effort: failure here is harmless (value has a TTL anyway).
+            if (!lockMap.isLocked(identifier)) {
+                removeDebugValue();
+            }
 
             log.debug("Unlocked reservation: {}", identifier);
 
@@ -245,15 +207,53 @@ final class HazelcastReservation implements Reservation {
         }
     }
 
-    private String buildDebugValue() {
-        String threadName = Thread.currentThread().getName();
-        String hostName = getHostName();
-        Instant now = Instant.now();
+    // ==================== Internal helpers ====================
 
-        return String.format("holder=%s@%s,acquired=%s", threadName, hostName, now);
+    /** Common post-acquisition bookkeeping: timestamp, metrics, debug value. */
+    private void recordAcquired(Instant start) {
+        acquiredAt = Instant.now();
+        Duration elapsed = Duration.between(start, Instant.now());
+        metrics.recordAcquisition(domain, elapsed, "acquired");
+        metrics.recordAcquisitionAttempt(domain, true);
+        storeDebugValue();
+        log.debug("Acquired reservation: {}", identifier);
     }
 
-    private static String getHostName() {
+    /** Records a failed acquisition attempt with the given result tag. */
+    private void recordFailure(Instant start, String result) {
+        Duration elapsed = Duration.between(start, Instant.now());
+        metrics.recordAcquisition(domain, elapsed, result);
+        metrics.recordAcquisitionAttempt(domain, false);
+        log.debug("Acquisition failed for reservation {} ({})", identifier, result);
+    }
+
+    /**
+     * Stores debug info in the map. Best-effort: failures are logged but do not
+     * affect lock acquisition, preventing a leak if this call throws.
+     */
+    private void storeDebugValue() {
+        try {
+            lockMap.set(identifier, buildDebugValue(), leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.debug("Failed to store debug value for {}: {}", identifier, e.getMessage());
+        }
+    }
+
+    /** Best-effort removal of the debug value from the map. */
+    private void removeDebugValue() {
+        try {
+            lockMap.remove(identifier);
+        } catch (Exception e) {
+            log.debug("Failed to remove debug value for {}: {}", identifier, e.getMessage());
+        }
+    }
+
+    private String buildDebugValue() {
+        return String.format("holder=%s@%s,acquired=%s",
+            Thread.currentThread().getName(), HOST_NAME, Instant.now());
+    }
+
+    private static String resolveHostName() {
         try {
             return InetAddress.getLocalHost().getHostName();
         } catch (UnknownHostException e) {
