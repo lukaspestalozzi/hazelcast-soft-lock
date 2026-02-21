@@ -179,8 +179,8 @@ public abstract class AbstractStressIntegrationTest {
 
         double opsPerSecond = totalOps.get() * 1000.0 / elapsedMs;
 
-        log.info("Throughput test: {} ops in {} ms = {:.0f} ops/sec, failures={}",
-                totalOps.get(), elapsedMs, opsPerSecond, failures.get());
+        log.info("Throughput test: {} ops in {} ms = {} ops/sec, failures={}",
+                totalOps.get(), elapsedMs, String.format("%.0f", opsPerSecond), failures.get());
 
         assertThat(completed).as("All threads should complete within timeout").isTrue();
         assertThat(totalOps.get()).as("Must complete significant operations").isGreaterThan(targetOps / 2);
@@ -459,8 +459,8 @@ public abstract class AbstractStressIntegrationTest {
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
         double cyclesPerSecond = totalCycles.get() * 1000.0 / elapsedMs;
 
-        log.info("Rapid cycles: {} in {} ms = {:.0f} cycles/sec, failures={}",
-                totalCycles.get(), elapsedMs, cyclesPerSecond, failures.get());
+        log.info("Rapid cycles: {} in {} ms = {} cycles/sec, failures={}",
+                totalCycles.get(), elapsedMs, String.format("%.0f", cyclesPerSecond), failures.get());
 
         assertThat(completed).isTrue();
         assertThat(failures.get()).isZero();
@@ -736,8 +736,8 @@ public abstract class AbstractStressIntegrationTest {
         double opsPerSec = totalSuccess.get() * 1000.0 / elapsedMs;
 
         log.info("Multi-key contention: {} keys x {} threads x {} iters", keyCount, threadsPerKey, iterationsPerThread);
-        log.info("  {} successes, {} failures in {} ms = {:.0f} ops/sec",
-                totalSuccess.get(), totalFailure.get(), elapsedMs, opsPerSec);
+        log.info("  {} successes, {} failures in {} ms = {} ops/sec",
+                totalSuccess.get(), totalFailure.get(), elapsedMs, String.format("%.0f", opsPerSec));
         log.info("  Occupancy violations: {}", occupancyViolations.get());
 
         assertThat(completed).isTrue();
@@ -813,7 +813,7 @@ public abstract class AbstractStressIntegrationTest {
         log.info("Sustained load test @ {} ops/sec target for {}s:", targetRate, durationSeconds);
         log.info("  Completed: {}, Acquired: {}, Failed: {}, Errors: {}",
                 completed.get(), lockAcquired.get(), lockFailed.get(), errors.get());
-        log.info("  Actual rate: {:.0f} ops/sec over {} ms", actualRate, elapsedMs);
+        log.info("  Actual rate: {} ops/sec over {} ms", String.format("%.0f", actualRate), elapsedMs);
 
         assertThat(allCompleted || completed.get() > totalOps / 2)
                 .as("Should complete most operations")
