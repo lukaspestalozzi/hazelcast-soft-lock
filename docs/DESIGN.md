@@ -46,7 +46,7 @@ Both implementations share the same API and behavioral guarantees.
 - **Domain isolation**: Hazelcast uses separate IMaps per domain; Oracle uses composite keys
 - Micrometer metrics integration for observability
 - Reentrant locking support
-- Checked exceptions for explicit error handling
+- Dedicated exception hierarchy (unchecked, as required by the `Lock` interface)
 - Shared test suite validating both implementations
 
 ### 1.3 Design Decisions Summary
@@ -63,7 +63,7 @@ Both implementations share the same API and behavioral guarantees.
 | Lease time config | Global default on manager | Simplicity with configurability |
 | Thread affinity | Strict (per-thread ownership) | Consistency with Lock contract |
 | Reentrancy | Supported | Same thread can lock multiple times |
-| Error handling | Checked exceptions | Explicit failure handling |
+| Error handling | Dedicated unchecked exception hierarchy | `Lock` methods cannot declare checked exceptions |
 | Project structure | Single module | Simpler build, single artifact |
 | Testing | Abstract base test class | Shared tests for both implementations |
 | Hazelcast value | String with debug info | Debuggability with low overhead |
@@ -785,19 +785,28 @@ class HazelcastReservation implements Reservation {
 
     @Override
     public void unlock() throws ReservationExpiredException {
+        // Per-thread hold tracking (shared per manager) distinguishes
+        // "never held" from "lease expired"
+        if (currentThreadHoldCount() == 0) {
+            throw new IllegalMonitorStateException(...);
+        }
         try {
-            lockMap.remove(identifier);  // Clean up debug value
+            if (currentThreadHoldCount() == 1) {
+                // Clean up debug value while still owning the lock; zero timeout
+                // so an expired holder never blocks on the new holder
+                lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
+            }
             lockMap.unlock(identifier);
         } catch (IllegalMonitorStateException e) {
-            // Lock expired or not owned
+            // Lease expired before unlock
             throw new ReservationExpiredException(domain, identifier);
         }
     }
 
     @Override
     public void forceUnlock() {
-        lockMap.remove(identifier);
         lockMap.forceUnlock(identifier);
+        lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);  // best-effort cleanup
     }
 
     @Override
@@ -1261,7 +1270,9 @@ ReservationManager manager = ReservationManager.oracle(dataSource)
 
 ### 7.1 Exception Strategy
 
-All public API methods use **checked exceptions** to force explicit handling:
+The `ReservationException` hierarchy extends `RuntimeException` because the
+`java.util.concurrent.locks.Lock` interface does not allow checked exceptions
+(only the SPI-level `LockingException` is checked):
 
 | Method | Throws | Reason |
 |--------|--------|--------|
