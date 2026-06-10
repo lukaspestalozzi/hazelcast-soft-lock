@@ -3,6 +3,7 @@ package com.github.reservation.hazelcast;
 import com.github.reservation.InvalidReservationKeyException;
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationManager;
+import com.github.reservation.internal.HoldTracker;
 import com.github.reservation.internal.ReservationMetrics;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
@@ -23,6 +24,7 @@ public final class HazelcastReservationManager implements ReservationManager {
     private final Duration leaseTime;
     private final String mapName;
     private final ReservationMetrics metrics;
+    private final HoldTracker holdTracker = new HoldTracker();
 
     HazelcastReservationManager(
             HazelcastInstance hazelcastInstance,
@@ -48,7 +50,8 @@ public final class HazelcastReservationManager implements ReservationManager {
             domain,
             identifier,
             leaseTime,
-            metrics
+            metrics,
+            holdTracker
         );
     }
 
