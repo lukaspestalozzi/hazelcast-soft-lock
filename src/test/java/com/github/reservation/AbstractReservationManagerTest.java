@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.*;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Abstract base test class defining the contract for all ReservationManager implementations.
@@ -89,9 +90,8 @@ public abstract class AbstractReservationManagerTest {
             assertThat(reservation.isLocked()).isTrue();
 
             // Wait for lease to expire
-            Thread.sleep(2500);
+            await().atMost(Duration.ofSeconds(8)).until(() -> !reservation.isLocked());
 
-            assertThat(reservation.isLocked()).isFalse();
             assertThatThrownBy(reservation::unlock)
                 .isInstanceOf(ReservationExpiredException.class);
         } finally {
@@ -161,7 +161,8 @@ public abstract class AbstractReservationManagerTest {
             Reservation reservation = shortLeaseManager.getReservation("expiry-acquire-test");
 
             reservation.lock();
-            Thread.sleep(1500); // Wait for expiry
+            // Wait for expiry
+            await().atMost(Duration.ofSeconds(8)).until(() -> !reservation.isLocked());
 
             // Another acquisition should succeed
             AtomicBoolean acquired = new AtomicBoolean(false);
@@ -301,6 +302,38 @@ public abstract class AbstractReservationManagerTest {
         assertThat(reservation.isLocked()).isFalse();
     }
 
+    @Test
+    @Timeout(10)
+    void shouldSupportReentrantLockingAcrossInstances() {
+        Reservation first = manager.getReservation("reentrant-instances");
+        Reservation second = manager.getReservation("reentrant-instances");
+
+        first.lock();
+        second.lock(); // Same thread, same identifier - must not block
+
+        assertThat(first.isLocked()).isTrue();
+
+        second.unlock();
+        // Still held (one hold remaining)
+        assertThat(first.isLocked()).isTrue();
+
+        first.unlock();
+        assertThat(first.isLocked()).isFalse();
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldAllowUnlockViaDifferentInstance() {
+        Reservation first = manager.getReservation("unlock-other-instance");
+        first.lock();
+
+        // The lock belongs to the thread, not the instance
+        Reservation second = manager.getReservation("unlock-other-instance");
+        second.unlock();
+
+        assertThat(first.isLocked()).isFalse();
+    }
+
     // ==================== Validation Tests ====================
 
     @Test
@@ -354,13 +387,13 @@ public abstract class AbstractReservationManagerTest {
             waiterThread.interrupt();
             waiterThread.join(3000);
 
-            // Either the thread was interrupted (exception caught) or it didn't acquire
-            // while the holder still had the lock.
-            if (exception.get() != null) {
-                assertThat(exception.get()).isInstanceOf(InterruptedException.class);
-            } else {
-                assertThat(acquired.get()).isFalse();
-            }
+            assertThat(waiterThread.isAlive())
+                .as("waiter thread must terminate after interrupt")
+                .isFalse();
+            assertThat(acquired.get()).isFalse();
+            assertThat(exception.get())
+                .as("lockInterruptibly must throw InterruptedException when interrupted")
+                .isInstanceOf(InterruptedException.class);
         } finally {
             holder.unlock();
         }
@@ -389,7 +422,7 @@ public abstract class AbstractReservationManagerTest {
         Reservation reservation = manager.getReservation("no-lock");
 
         assertThatThrownBy(reservation::unlock)
-            .isInstanceOf(Exception.class);
+            .isInstanceOf(IllegalMonitorStateException.class);
     }
 
     // ==================== Builder Validation Tests ====================
