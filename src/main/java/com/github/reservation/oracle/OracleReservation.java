@@ -2,7 +2,9 @@ package com.github.reservation.oracle;
 
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationAcquisitionException;
+import com.github.reservation.ReservationException;
 import com.github.reservation.ReservationExpiredException;
+import com.github.reservation.internal.HoldTracker;
 import com.github.reservation.internal.ReservationMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,11 +32,10 @@ final class OracleReservation implements Reservation {
     private final String reservationKey;
     private final Duration leaseTime;
     private final ReservationMetrics metrics;
-
-    // Track the holder ID for this thread
-    private final ThreadLocal<String> currentHolder = new ThreadLocal<>();
-    private final ThreadLocal<Instant> acquiredAt = new ThreadLocal<>();
-    private final ThreadLocal<Integer> lockCount = ThreadLocal.withInitial(() -> 0);
+    // Shared per manager so reentrancy works across Reservation instances
+    private final HoldTracker holdTracker;
+    // Disambiguates holders from different managers in the same JVM/host
+    private final String managerId;
 
     OracleReservation(
             LockingStrategy lockingStrategy,
@@ -42,13 +43,17 @@ final class OracleReservation implements Reservation {
             String identifier,
             String reservationKey,
             Duration leaseTime,
-            ReservationMetrics metrics) {
+            ReservationMetrics metrics,
+            HoldTracker holdTracker,
+            String managerId) {
         this.lockingStrategy = lockingStrategy;
         this.domain = domain;
         this.identifier = identifier;
         this.reservationKey = reservationKey;
         this.leaseTime = leaseTime;
         this.metrics = metrics;
+        this.holdTracker = holdTracker;
+        this.managerId = managerId;
     }
 
     @Override
@@ -85,18 +90,19 @@ final class OracleReservation implements Reservation {
     /**
      * Internal check for reentrancy - checks if current thread holds this lock.
      */
-    private boolean heldByCurrentThread() {
-        String holder = currentHolder.get();
-        if (holder == null) {
-            return false;
+    private HoldTracker.Hold currentThreadHold() {
+        HoldTracker.Hold hold = holdTracker.get(reservationKey);
+        if (hold == null || hold.getCount() == 0) {
+            return null;
         }
 
         try {
             Optional<LockingStrategy.LockInfo> info = lockingStrategy.getLockInfo(reservationKey);
-            return info.map(i -> holder.equals(i.holder())).orElse(false);
+            boolean stillHeld = info.map(i -> hold.getHolder().equals(i.holder())).orElse(false);
+            return stillHeld ? hold : null;
         } catch (LockingException e) {
             log.warn("Failed to check lock ownership for {}: {}", reservationKey, e.getMessage());
-            return false;
+            return null;
         }
     }
 
@@ -105,9 +111,7 @@ final class OracleReservation implements Reservation {
         log.warn("Force unlocking reservation: {}", reservationKey);
         try {
             lockingStrategy.forceRelease(reservationKey);
-            currentHolder.remove();
-            acquiredAt.remove();
-            lockCount.set(0);
+            holdTracker.remove(reservationKey);
         } catch (LockingException e) {
             log.error("Failed to force unlock {}: {}", reservationKey, e.getMessage());
         }
@@ -116,9 +120,10 @@ final class OracleReservation implements Reservation {
     @Override
     public void lock() {
         // Check for reentrancy
-        if (heldByCurrentThread()) {
-            lockCount.set(lockCount.get() + 1);
-            log.debug("Reentrant lock acquired: {} (count={})", reservationKey, lockCount.get());
+        HoldTracker.Hold existing = currentThreadHold();
+        if (existing != null) {
+            existing.setCount(existing.getCount() + 1);
+            log.debug("Reentrant lock acquired: {} (count={})", reservationKey, existing.getCount());
             return;
         }
 
@@ -129,13 +134,7 @@ final class OracleReservation implements Reservation {
         while (true) {
             try {
                 if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
-                    currentHolder.set(holder);
-                    acquiredAt.set(Instant.now());
-                    lockCount.set(1);
-
-                    Duration elapsed = Duration.between(start, Instant.now());
-                    metrics.recordAcquisition(domain, elapsed, "acquired");
-                    metrics.recordAcquisitionAttempt(domain, true);
+                    recordAcquired(holder, start);
 
                     log.debug("Acquired reservation: {}", reservationKey);
                     return;
@@ -156,9 +155,7 @@ final class OracleReservation implements Reservation {
                 throw new ReservationAcquisitionException(domain, identifier,
                     "Interrupted while waiting for reservation", e);
             } catch (LockingException e) {
-                Duration elapsed = Duration.between(start, Instant.now());
-                metrics.recordAcquisition(domain, elapsed, "error");
-                metrics.recordAcquisitionAttempt(domain, false);
+                recordError(start);
 
                 throw new ReservationAcquisitionException(domain, identifier,
                     "Database error acquiring reservation", e);
@@ -173,9 +170,11 @@ final class OracleReservation implements Reservation {
         }
 
         // Check for reentrancy
-        if (heldByCurrentThread()) {
-            lockCount.set(lockCount.get() + 1);
-            log.debug("Reentrant lock acquired (interruptibly): {} (count={})", reservationKey, lockCount.get());
+        HoldTracker.Hold existing = currentThreadHold();
+        if (existing != null) {
+            existing.setCount(existing.getCount() + 1);
+            log.debug("Reentrant lock acquired (interruptibly): {} (count={})",
+                reservationKey, existing.getCount());
             return;
         }
 
@@ -190,13 +189,7 @@ final class OracleReservation implements Reservation {
 
             try {
                 if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
-                    currentHolder.set(holder);
-                    acquiredAt.set(Instant.now());
-                    lockCount.set(1);
-
-                    Duration elapsed = Duration.between(start, Instant.now());
-                    metrics.recordAcquisition(domain, elapsed, "acquired");
-                    metrics.recordAcquisitionAttempt(domain, true);
+                    recordAcquired(holder, start);
 
                     log.debug("Acquired reservation (interruptibly): {}", reservationKey);
                     return;
@@ -213,9 +206,7 @@ final class OracleReservation implements Reservation {
                 metrics.recordAcquisition(domain, elapsed, "interrupted");
                 throw e;
             } catch (LockingException e) {
-                Duration elapsed = Duration.between(start, Instant.now());
-                metrics.recordAcquisition(domain, elapsed, "error");
-                metrics.recordAcquisitionAttempt(domain, false);
+                recordError(start);
 
                 throw new ReservationAcquisitionException(domain, identifier,
                     "Database error acquiring reservation", e);
@@ -226,9 +217,10 @@ final class OracleReservation implements Reservation {
     @Override
     public boolean tryLock() {
         // Check for reentrancy
-        if (heldByCurrentThread()) {
-            lockCount.set(lockCount.get() + 1);
-            log.debug("Reentrant tryLock acquired: {} (count={})", reservationKey, lockCount.get());
+        HoldTracker.Hold existing = currentThreadHold();
+        if (existing != null) {
+            existing.setCount(existing.getCount() + 1);
+            log.debug("Reentrant tryLock acquired: {} (count={})", reservationKey, existing.getCount());
             return true;
         }
 
@@ -238,19 +230,12 @@ final class OracleReservation implements Reservation {
         try {
             boolean acquired = lockingStrategy.tryAcquire(reservationKey, holder, leaseTime);
 
-            Duration elapsed = Duration.between(start, Instant.now());
-
             if (acquired) {
-                currentHolder.set(holder);
-                acquiredAt.set(Instant.now());
-                lockCount.set(1);
-
-                metrics.recordAcquisition(domain, elapsed, "acquired");
-                metrics.recordAcquisitionAttempt(domain, true);
+                recordAcquired(holder, start);
 
                 log.debug("Try-locked reservation: {}", reservationKey);
             } else {
-                metrics.recordAcquisition(domain, elapsed, "unavailable");
+                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "unavailable");
                 metrics.recordAcquisitionAttempt(domain, false);
 
                 log.debug("Try-lock failed, reservation unavailable: {}", reservationKey);
@@ -259,6 +244,7 @@ final class OracleReservation implements Reservation {
             return acquired;
 
         } catch (LockingException e) {
+            recordError(start);
             log.warn("Error during tryLock for {}: {}", reservationKey, e.getMessage());
             return false;
         }
@@ -271,9 +257,11 @@ final class OracleReservation implements Reservation {
         }
 
         // Check for reentrancy
-        if (heldByCurrentThread()) {
-            lockCount.set(lockCount.get() + 1);
-            log.debug("Reentrant tryLock (timed) acquired: {} (count={})", reservationKey, lockCount.get());
+        HoldTracker.Hold existing = currentThreadHold();
+        if (existing != null) {
+            existing.setCount(existing.getCount() + 1);
+            log.debug("Reentrant tryLock (timed) acquired: {} (count={})",
+                reservationKey, existing.getCount());
             return true;
         }
 
@@ -289,13 +277,7 @@ final class OracleReservation implements Reservation {
 
             try {
                 if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
-                    currentHolder.set(holder);
-                    acquiredAt.set(Instant.now());
-                    lockCount.set(1);
-
-                    Duration elapsed = Duration.between(start, Instant.now());
-                    metrics.recordAcquisition(domain, elapsed, "acquired");
-                    metrics.recordAcquisitionAttempt(domain, true);
+                    recordAcquired(holder, start);
 
                     log.debug("Try-locked reservation with timeout: {}", reservationKey);
                     return true;
@@ -337,60 +319,66 @@ final class OracleReservation implements Reservation {
 
     @Override
     public void unlock() {
-        String holder = currentHolder.get();
-        if (holder == null) {
-            throw new IllegalMonitorStateException("Current thread does not hold the reservation: " + reservationKey);
+        HoldTracker.Hold hold = holdTracker.get(reservationKey);
+        if (hold == null || hold.getCount() == 0) {
+            throw new IllegalMonitorStateException(
+                "Current thread does not hold the reservation: " + reservationKey);
         }
 
         // Handle reentrancy
-        int count = lockCount.get();
-        if (count > 1) {
-            lockCount.set(count - 1);
-            log.debug("Reentrant unlock: {} (count={})", reservationKey, count - 1);
+        if (hold.getCount() > 1) {
+            hold.setCount(hold.getCount() - 1);
+            log.debug("Reentrant unlock: {} (count={})", reservationKey, hold.getCount());
             return;
         }
 
+        boolean released;
         try {
-            boolean released = lockingStrategy.release(reservationKey, holder);
-
-            if (released) {
-                Instant acquired = acquiredAt.get();
-                if (acquired != null) {
-                    Duration heldTime = Duration.between(acquired, Instant.now());
-                    metrics.recordHeldTime(domain, heldTime);
-                }
-
-                currentHolder.remove();
-                acquiredAt.remove();
-                lockCount.set(0);
-
-                log.debug("Unlocked reservation: {}", reservationKey);
-            } else {
-                // Lock was not found or was held by someone else (expired)
-                currentHolder.remove();
-                acquiredAt.remove();
-                lockCount.set(0);
-
-                metrics.recordExpiration(domain);
-
-                log.warn("Unlock failed for reservation {} - likely expired", reservationKey);
-
-                throw new ReservationExpiredException(domain, identifier);
-            }
+            released = lockingStrategy.release(reservationKey, hold.getHolder());
         } catch (LockingException e) {
-            currentHolder.remove();
-            acquiredAt.remove();
-            lockCount.set(0);
+            // Database error - the lock row may still exist, so keep the local hold
+            // state to allow a retry instead of misreporting this as an expired lease.
+            throw new ReservationException(
+                "Failed to release reservation " + reservationKey
+                    + "; the reservation may still be held", e);
+        }
+
+        if (released) {
+            metrics.recordHeldTime(domain, Duration.between(hold.getAcquiredAt(), Instant.now()));
+            holdTracker.remove(reservationKey);
+
+            log.debug("Unlocked reservation: {}", reservationKey);
+        } else {
+            // Lock was not found or was held by someone else (expired)
+            holdTracker.remove(reservationKey);
+            metrics.recordExpiration(domain);
+
+            log.warn("Unlock failed for reservation {} - likely expired", reservationKey);
 
             throw new ReservationExpiredException(domain, identifier);
         }
+    }
+
+    private void recordAcquired(String holder, Instant start) {
+        HoldTracker.Hold hold = holdTracker.getOrCreate(reservationKey);
+        hold.setHolder(holder);
+        hold.setAcquiredAt(Instant.now());
+        hold.setCount(1);
+
+        metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "acquired");
+        metrics.recordAcquisitionAttempt(domain, true);
+    }
+
+    private void recordError(Instant start) {
+        metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "error");
+        metrics.recordAcquisitionAttempt(domain, false);
     }
 
     private String buildHolder() {
         String threadName = Thread.currentThread().getName();
         String threadId = String.valueOf(Thread.currentThread().threadId());
         String hostName = getHostName();
-        return threadName + "-" + threadId + "@" + hostName;
+        return threadName + "-" + threadId + "@" + hostName + "#" + managerId;
     }
 
     private static String getHostName() {

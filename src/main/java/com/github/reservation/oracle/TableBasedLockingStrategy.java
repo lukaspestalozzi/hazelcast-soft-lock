@@ -37,11 +37,10 @@ public class TableBasedLockingStrategy implements LockingStrategy {
 
     // SQL statements
     private final String insertSql;
-    private final String deleteSql;
+    private final String releaseSql;
     private final String deleteForceSql;
     private final String selectSql;
     private final String cleanupExpiredSql;
-    private final String updateSql;
 
     public TableBasedLockingStrategy(DataSource dataSource, String tableName) {
         this.dataSource = dataSource;
@@ -52,8 +51,9 @@ public class TableBasedLockingStrategy implements LockingStrategy {
         this.insertSql = String.format(
             "INSERT INTO %s (reservation_key, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
             tableName);
-        this.deleteSql = String.format(
-            "DELETE FROM %s WHERE reservation_key = ? AND holder = ?",
+        // Only release if the lock exists AND is not expired AND is owned by holder
+        this.releaseSql = String.format(
+            "DELETE FROM %s WHERE reservation_key = ? AND holder = ? AND expires_at > ?",
             tableName);
         this.deleteForceSql = String.format(
             "DELETE FROM %s WHERE reservation_key = ?",
@@ -63,9 +63,6 @@ public class TableBasedLockingStrategy implements LockingStrategy {
             tableName);
         this.cleanupExpiredSql = String.format(
             "DELETE FROM %s WHERE reservation_key = ? AND expires_at <= ?",
-            tableName);
-        this.updateSql = String.format(
-            "UPDATE %s SET holder = ?, acquired_at = ?, expires_at = ? WHERE reservation_key = ? AND holder = ?",
             tableName);
     }
 
@@ -112,13 +109,8 @@ public class TableBasedLockingStrategy implements LockingStrategy {
 
     @Override
     public boolean release(String reservationKey, String holder) throws LockingException {
-        // Only release if the lock exists AND is not expired AND is owned by holder
-        String releaseIfValidSql = String.format(
-            "DELETE FROM %s WHERE reservation_key = ? AND holder = ? AND expires_at > ?",
-            tableName);
-
         try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(releaseIfValidSql)) {
+             PreparedStatement ps = conn.prepareStatement(releaseSql)) {
             ps.setString(1, reservationKey);
             ps.setString(2, holder);
             ps.setTimestamp(3, Timestamp.from(Instant.now()));
