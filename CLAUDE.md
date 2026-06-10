@@ -35,12 +35,26 @@ Reservation reservation = ordersManager.getReservation("order-12345");
 src/main/java/com/github/reservation/
 ├── Reservation.java              # Main Lock interface
 ├── ReservationManager.java       # Factory with builder pattern
+├── AbstractReservationManagerBuilder.java
+├── ReservationException.java     # Base of the (unchecked) exception hierarchy
+├── ReservationAcquisitionException.java
+├── ReservationExpiredException.java
+├── InvalidReservationKeyException.java
+├── internal/                     # Shared internals (not public API)
+│   ├── HoldTracker.java          # Per-thread hold state, shared per manager
+│   ├── ReservationKeyBuilder.java
+│   └── ReservationMetrics.java
 ├── hazelcast/                    # Hazelcast backend
-│   └── HazelcastReservation.java
+│   ├── HazelcastReservation.java
+│   ├── HazelcastReservationManager.java
+│   └── HazelcastReservationManagerBuilder.java
 └── oracle/                       # JDBC/Oracle backend
-    ├── LockingStrategy.java      # Pluggable locking strategy interface
+    ├── LockingStrategy.java      # Pluggable locking strategy interface (checked LockingException)
+    ├── LockingException.java
     ├── TableBasedLockingStrategy.java
-    └── OracleReservation.java
+    ├── OracleReservation.java
+    ├── OracleReservationManager.java
+    └── OracleReservationManagerBuilder.java
 ```
 
 For detailed architecture, see `docs/DESIGN.md`.
@@ -118,10 +132,10 @@ Use `scripts/run-maven-with-proxy.sh` to automatically start the proxy and run M
 
 ## Code Conventions
 
-- Exceptions: Use checked exceptions (`ReservationException` hierarchy)
+- Exceptions: `ReservationException` hierarchy is unchecked (the `Lock` interface cannot declare checked exceptions); the JDBC SPI-level `LockingException` is checked
 - Domain: Required on manager builder (throws `IllegalStateException` if not set)
 - Key format: Hazelcast uses identifier only (domain isolation via separate maps); Oracle uses `{domain}::{identifier}`
-- Thread safety: Implementations must be thread-safe; use ThreadLocal for ownership tracking
+- Thread safety: Implementations must be thread-safe; ownership is tracked per thread via the per-manager `HoldTracker`, so reentrancy and unlock work across `Reservation` instances from the same manager
 - Reentrancy: Both backends support reentrant locking
 
 ## Testing Notes
