@@ -26,6 +26,9 @@ final class OracleReservation implements Reservation {
     private static final Duration INITIAL_POLL_INTERVAL = Duration.ofMillis(50);
     private static final Duration MAX_POLL_INTERVAL = Duration.ofSeconds(1);
 
+    // Resolved once; a DNS lookup per lock operation is needless overhead
+    private static final String HOST_NAME = resolveHostName();
+
     private final LockingStrategy lockingStrategy;
     private final String domain;
     private final String identifier;
@@ -377,11 +380,10 @@ final class OracleReservation implements Reservation {
     private String buildHolder() {
         String threadName = Thread.currentThread().getName();
         String threadId = String.valueOf(Thread.currentThread().threadId());
-        String hostName = getHostName();
-        return threadName + "-" + threadId + "@" + hostName + "#" + managerId;
+        return threadName + "-" + threadId + "@" + HOST_NAME + "#" + managerId;
     }
 
-    private static String getHostName() {
+    private static String resolveHostName() {
         try {
             return InetAddress.getLocalHost().getHostName();
         } catch (UnknownHostException e) {

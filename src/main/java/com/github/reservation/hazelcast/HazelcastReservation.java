@@ -26,6 +26,9 @@ final class HazelcastReservation implements Reservation {
     // slices of this length and checks the interrupt flag between attempts.
     private static final long INTERRUPT_POLL_MILLIS = 100;
 
+    // Resolved once; a DNS lookup per lock operation is needless overhead
+    private static final String HOST_NAME = resolveHostName();
+
     private final IMap<String, String> lockMap;
     private final String domain;
     private final String identifier;
@@ -80,9 +83,14 @@ final class HazelcastReservation implements Reservation {
     public void forceUnlock() {
         log.warn("Force unlocking reservation: {}", identifier);
         lockMap.forceUnlock(identifier);
-        // Best-effort cleanup of the debug value; zero timeout so we never block on a
-        // holder that acquired the lock right after the force unlock.
-        lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
+        try {
+            // Best-effort cleanup of the debug value; zero timeout so we never block on a
+            // holder that acquired the lock right after the force unlock.
+            lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.debug("Failed to remove debug value during forceUnlock for {}: {}",
+                identifier, e.getMessage());
+        }
         holdTracker.remove(identifier);
     }
 
@@ -203,10 +211,16 @@ final class HazelcastReservation implements Reservation {
 
         try {
             if (hold.getCount() == 1) {
-                // Remove the debug value while we still own the lock. Zero timeout so we
-                // never block on (or delete the value of) a holder that took over after
-                // our lease expired.
-                lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
+                try {
+                    // Remove the debug value while we still own the lock. Zero timeout so we
+                    // never block on (or delete the value of) a holder that took over after
+                    // our lease expired.
+                    lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
+                } catch (Exception e) {
+                    // Best-effort: a failed debug cleanup must not prevent the unlock below
+                    log.debug("Failed to remove debug value during unlock for {}: {}",
+                        identifier, e.getMessage());
+                }
             }
 
             lockMap.unlock(identifier);
@@ -231,8 +245,7 @@ final class HazelcastReservation implements Reservation {
     }
 
     private void recordAcquired(Instant start) {
-        // Store debug value (refreshes the entry TTL on reentrant acquisition)
-        lockMap.set(identifier, buildDebugValue(), leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+        storeDebugValue();
 
         HoldTracker.Hold hold = holdTracker.getOrCreate(identifier);
         if (hold.getCount() > 0 && leaseLapsed(hold)) {
@@ -257,15 +270,26 @@ final class HazelcastReservation implements Reservation {
         metrics.recordAcquisitionAttempt(domain, false);
     }
 
-    private String buildDebugValue() {
-        String threadName = Thread.currentThread().getName();
-        String hostName = getHostName();
-        Instant now = Instant.now();
-
-        return String.format("holder=%s@%s,acquired=%s", threadName, hostName, now);
+    private void storeDebugValue() {
+        // Best-effort: the lock is already held at this point, so a failed debug write
+        // must not make the acquisition look failed - the caller would never unlock,
+        // leaking the lock until lease expiry. Also refreshes the entry TTL on
+        // reentrant acquisition.
+        try {
+            lockMap.set(identifier, buildDebugValue(), leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.debug("Failed to store debug value for {}: {}", identifier, e.getMessage());
+        }
     }
 
-    private static String getHostName() {
+    private String buildDebugValue() {
+        String threadName = Thread.currentThread().getName();
+        Instant now = Instant.now();
+
+        return String.format("holder=%s@%s,acquired=%s", threadName, HOST_NAME, now);
+    }
+
+    private static String resolveHostName() {
         try {
             return InetAddress.getLocalHost().getHostName();
         } catch (UnknownHostException e) {
