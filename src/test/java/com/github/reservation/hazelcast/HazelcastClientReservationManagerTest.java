@@ -40,8 +40,17 @@ class HazelcastClientReservationManagerTest extends AbstractReservationManagerTe
         config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
         member = Hazelcast.newHazelcastInstance(config);
 
+        // Connect to the member's exact address with a bounded retry: the default
+        // config scans fixed localhost ports and retries the cluster connect forever,
+        // which silently hangs the whole build if the member is not where expected.
+        var memberAddress = member.getCluster().getLocalMember().getAddress();
         ClientConfig clientConfig = new ClientConfig();
         clientConfig.setClusterName(clusterName);
+        clientConfig.getNetworkConfig().addAddress(
+            memberAddress.getHost() + ":" + memberAddress.getPort());
+        clientConfig.getConnectionStrategyConfig()
+            .getConnectionRetryConfig()
+            .setClusterConnectTimeoutMillis(30_000);
         client = HazelcastClient.newHazelcastClient(clientConfig);
     }
 
