@@ -17,8 +17,7 @@ import java.time.Duration;
  * JDBC stress tests using H2 in-memory database.
  *
  * <p>Runs all shared stress tests from {@link AbstractStressIntegrationTest}
- * against H2. For Oracle integration tests, use OracleStressIntegrationTest
- * with Testcontainers.</p>
+ * against H2. Connection pool sized for heavy concurrent load (50+ threads).</p>
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class JdbcStressIntegrationTest extends AbstractStressIntegrationTest {
@@ -32,9 +31,10 @@ class JdbcStressIntegrationTest extends AbstractStressIntegrationTest {
     void setupDatabase() throws SQLException {
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl("jdbc:h2:mem:stresstest;DB_CLOSE_DELAY=-1");
-        config.setMaximumPoolSize(20);
-        config.setMinimumIdle(5);
-        config.setConnectionTimeout(5000);
+        // Sized for 50+ concurrent threads doing lock operations
+        config.setMaximumPoolSize(60);
+        config.setMinimumIdle(10);
+        config.setConnectionTimeout(10000);
 
         dataSource = new HikariDataSource(config);
 
@@ -51,7 +51,7 @@ class JdbcStressIntegrationTest extends AbstractStressIntegrationTest {
                 """);
         }
 
-        log.info("Database initialized with {} max connections", 20);
+        log.info("Database initialized with {} max connections", config.getMaximumPoolSize());
     }
 
     @AfterAll
