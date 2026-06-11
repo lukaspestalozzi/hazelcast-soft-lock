@@ -183,6 +183,29 @@ public abstract class AbstractReservationManagerTest {
         }
     }
 
+    @Test
+    @Timeout(15)
+    void shouldResetStaleHoldWhenReacquiringAfterExpiry() {
+        ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(1));
+        try {
+            Reservation reservation = shortLeaseManager.getReservation("stale-hold");
+
+            reservation.lock();
+            // Let the lease lapse without unlocking
+            await().atMost(Duration.ofSeconds(8)).until(() -> !reservation.isLocked());
+
+            // Re-acquiring must start a fresh hold, not stack on the expired one
+            reservation.lock();
+            reservation.unlock();
+            assertThat(reservation.isLocked()).isFalse();
+
+            assertThatThrownBy(reservation::unlock)
+                .isInstanceOf(IllegalMonitorStateException.class);
+        } finally {
+            shortLeaseManager.close();
+        }
+    }
+
     // ==================== tryLock Tests ====================
 
     @Test

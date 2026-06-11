@@ -30,7 +30,7 @@ public final class OracleReservationManager implements ReservationManager {
     private final ReservationKeyBuilder keyBuilder = new ReservationKeyBuilder(KEY_DELIMITER);
     private final HoldTracker holdTracker = new HoldTracker();
     // Disambiguates holders from different managers in the same JVM/host
-    private final String managerId = UUID.randomUUID().toString().substring(0, 8);
+    private final String managerId = UUID.randomUUID().toString();
 
     OracleReservationManager(
             DataSource dataSource,

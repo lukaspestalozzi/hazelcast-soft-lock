@@ -784,7 +784,7 @@ class HazelcastReservation implements Reservation {
     }
 
     @Override
-    public void unlock() throws ReservationExpiredException {
+    public void unlock() {
         // Per-thread hold tracking (shared per manager) distinguishes
         // "never held" from "lease expired"
         if (currentThreadHoldCount() == 0) {

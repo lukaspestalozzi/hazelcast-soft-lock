@@ -235,11 +235,21 @@ final class HazelcastReservation implements Reservation {
         lockMap.set(identifier, buildDebugValue(), leaseTime.toMillis(), TimeUnit.MILLISECONDS);
 
         HoldTracker.Hold hold = holdTracker.getOrCreate(identifier);
+        if (hold.getCount() > 0 && leaseLapsed(hold)) {
+            // The previous hold expired without an unlock, so this acquisition starts a
+            // fresh cluster-side hold; carrying the stale count forward would make later
+            // unlocks release more than was actually acquired.
+            hold.setCount(0);
+        }
         hold.setCount(hold.getCount() + 1);
         hold.setAcquiredAt(Instant.now());
 
         metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "acquired");
         metrics.recordAcquisitionAttempt(domain, true);
+    }
+
+    private boolean leaseLapsed(HoldTracker.Hold hold) {
+        return Duration.between(hold.getAcquiredAt(), Instant.now()).compareTo(leaseTime) >= 0;
     }
 
     private void recordError(Instant start) {
