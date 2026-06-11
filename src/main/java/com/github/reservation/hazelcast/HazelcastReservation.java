@@ -97,8 +97,22 @@ final class HazelcastReservation implements Reservation {
     @Override
     public void lock() {
         Instant start = Instant.now();
+        boolean interrupted = false;
         try {
-            lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+            while (true) {
+                try {
+                    lockMap.lock(identifier, leaseTime.toMillis(), TimeUnit.MILLISECONDS);
+                    break;
+                } catch (Exception e) {
+                    // Lock.lock() must keep waiting through interrupts; the client-side
+                    // proxy surfaces them as HazelcastException(InterruptedException)
+                    if (causedByInterrupt(e) || Thread.interrupted()) {
+                        interrupted = true;
+                        continue;
+                    }
+                    throw e;
+                }
+            }
             recordAcquired(start);
 
             log.debug("Acquired reservation: {}", identifier);
@@ -108,6 +122,10 @@ final class HazelcastReservation implements Reservation {
 
             throw new ReservationAcquisitionException(domain, identifier,
                 "Failed to acquire reservation", e);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -133,6 +151,12 @@ final class HazelcastReservation implements Reservation {
             metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
             throw e;
         } catch (Exception e) {
+            // The client-side proxy wraps interrupts in HazelcastException instead of
+            // throwing InterruptedException like the member-side proxy does
+            if (causedByInterrupt(e) || Thread.interrupted()) {
+                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+                throw interruptedException(e);
+            }
             recordError(start);
 
             throw new ReservationAcquisitionException(domain, identifier,
@@ -165,6 +189,11 @@ final class HazelcastReservation implements Reservation {
             metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
             return false;
         } catch (Exception e) {
+            if (causedByInterrupt(e)) {
+                Thread.currentThread().interrupt();
+                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+                return false;
+            }
             recordError(start);
             log.warn("Error during tryLock for {}: {}", identifier, e.getMessage());
             return false;
@@ -198,6 +227,15 @@ final class HazelcastReservation implements Reservation {
         } catch (InterruptedException e) {
             metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
             throw e;
+        } catch (Exception e) {
+            if (causedByInterrupt(e) || Thread.interrupted()) {
+                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+                throw interruptedException(e);
+            }
+            throw e instanceof RuntimeException re
+                ? re
+                : new ReservationAcquisitionException(domain, identifier,
+                    "Failed to acquire reservation", e);
         }
     }
 
@@ -280,6 +318,22 @@ final class HazelcastReservation implements Reservation {
         } catch (Exception e) {
             log.debug("Failed to store debug value for {}: {}", identifier, e.getMessage());
         }
+    }
+
+    private static boolean causedByInterrupt(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof InterruptedException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private InterruptedException interruptedException(Exception cause) {
+        InterruptedException ie = new InterruptedException(
+            "Interrupted while acquiring reservation: " + identifier);
+        ie.initCause(cause);
+        return ie;
     }
 
     private String buildDebugValue() {
