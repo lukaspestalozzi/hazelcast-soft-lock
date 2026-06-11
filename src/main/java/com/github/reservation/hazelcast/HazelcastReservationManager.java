@@ -7,7 +7,6 @@ import com.github.reservation.internal.HoldTracker;
 import com.github.reservation.internal.ReservationMetrics;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
-import io.micrometer.core.instrument.MeterRegistry;
 
 import java.time.Duration;
 
@@ -31,13 +30,13 @@ public final class HazelcastReservationManager implements ReservationManager {
             String domain,
             Duration leaseTime,
             String mapName,
-            MeterRegistry meterRegistry) {
+            Object meterRegistry) {
         this.hazelcastInstance = hazelcastInstance;
         this.domain = domain;
         this.lockMap = hazelcastInstance.getMap(mapName);
         this.leaseTime = leaseTime;
         this.mapName = mapName;
-        this.metrics = new ReservationMetrics(meterRegistry, "hazelcast");
+        this.metrics = ReservationMetrics.create(meterRegistry, "hazelcast");
     }
 
     @Override
