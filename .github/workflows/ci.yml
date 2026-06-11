@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     strategy:
       matrix:
@@ -42,6 +43,7 @@ jobs:
 
   integration-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: build
 
     name: Integration Tests
@@ -69,6 +71,7 @@ jobs:
 
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [ build, integration-tests ]
 
     name: Package

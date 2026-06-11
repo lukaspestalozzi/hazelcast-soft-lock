@@ -146,6 +146,8 @@
                     <excludes>
                         <exclude>**/*IntegrationTest.java</exclude>
                     </excludes>
+                    <!-- Kill a hung test JVM instead of stalling the build silently -->
+                    <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
                 </configuration>
             </plugin>
         </plugins>
@@ -165,6 +167,8 @@
                             <includes>
                                 <include>**/*IntegrationTest.java</include>
                             </includes>
+                            <!-- Kill a hung test JVM instead of stalling the build silently -->
+                            <forkedProcessTimeoutInSeconds>2700</forkedProcessTimeoutInSeconds>
                         </configuration>
                         <executions>
                             <execution>
