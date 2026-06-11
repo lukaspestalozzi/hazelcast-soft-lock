@@ -105,8 +105,11 @@ final class HazelcastReservation implements Reservation {
                     break;
                 } catch (Exception e) {
                     // Lock.lock() must keep waiting through interrupts; the client-side
-                    // proxy surfaces them as HazelcastException(InterruptedException)
-                    if (causedByInterrupt(e) || Thread.interrupted()) {
+                    // proxy surfaces them as HazelcastException(InterruptedException).
+                    // Always clear the flag before retrying - a still-set flag would make
+                    // the next lock() attempt fail immediately and this loop spin forever.
+                    boolean flagWasSet = Thread.interrupted();
+                    if (flagWasSet || causedByInterrupt(e)) {
                         interrupted = true;
                         continue;
                     }
