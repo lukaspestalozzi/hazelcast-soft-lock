@@ -161,10 +161,12 @@ public abstract class AbstractReservationManagerTest {
 
         AtomicBoolean acquired = new AtomicBoolean(false);
         AtomicReference<Throwable> error = new AtomicReference<>();
+        CountDownLatch waiterStarted = new CountDownLatch(1);
 
         Thread waiter = new Thread(() -> {
             try {
                 Reservation waiterRes = manager.getReservation("block-test");
+                waiterStarted.countDown();
                 waiterRes.lock(); // should block
                 acquired.set(true);
                 waiterRes.unlock();
@@ -174,7 +176,10 @@ public abstract class AbstractReservationManagerTest {
         });
 
         waiter.start();
-        Thread.sleep(500); // let the waiter block
+        assertThat(waiterStarted.await(5, TimeUnit.SECONDS))
+            .as("waiter thread should start")
+            .isTrue();
+        Thread.sleep(500); // give the waiter time to enter lock()
 
         // waiter should still be blocking
         assertThat(acquired.get()).isFalse();

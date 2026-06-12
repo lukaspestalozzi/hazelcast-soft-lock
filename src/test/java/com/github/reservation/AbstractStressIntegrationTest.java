@@ -210,7 +210,7 @@ public abstract class AbstractStressIntegrationTest {
         assertThat(totalOps.get()).as("Must complete significant operations").isGreaterThan(targetOps / 2);
         assertThat(opsPerSecond)
                 .as("Should sustain at least %.0f ops/sec", minThroughputOpsPerSec())
-                .isGreaterThan(minThroughputOpsPerSec());
+                .isGreaterThanOrEqualTo(minThroughputOpsPerSec());
     }
 
     // ==================== 3. HIGH CONTENTION ON SINGLE KEY ====================
@@ -1343,7 +1343,7 @@ public abstract class AbstractStressIntegrationTest {
         assertThat(completed).isTrue();
         assertThat(totalOpsPerSec)
                 .as("Should sustain at least %.0f ops/sec across all domains", minThroughputOpsPerSec())
-                .isGreaterThan(minThroughputOpsPerSec());
+                .isGreaterThanOrEqualTo(minThroughputOpsPerSec());
     }
 
     // ==================== 21. LEASE TIME BOUNDARY ====================
