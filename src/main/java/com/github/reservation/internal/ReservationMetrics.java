@@ -27,23 +27,30 @@ public interface ReservationMetrics {
      * @param meterRegistry a {@code io.micrometer.core.instrument.MeterRegistry}, or null
      * @param backend backend identifier tag (e.g. "hazelcast", "oracle")
      * @return a metrics instance, never null
+     * @throws IllegalArgumentException if Micrometer is on the classpath but
+     *         {@code meterRegistry} is not a MeterRegistry instance
      */
     static ReservationMetrics create(Object meterRegistry, String backend) {
         if (meterRegistry == null) {
             return NoOpReservationMetrics.INSTANCE;
         }
-        if (!isMicrometerAvailable()) {
+        Class<?> registryClass = micrometerRegistryClass();
+        if (registryClass == null) {
             return NoOpReservationMetrics.INSTANCE;
+        }
+        if (!registryClass.isInstance(meterRegistry)) {
+            throw new IllegalArgumentException(
+                "meterRegistry must be an instance of io.micrometer.core.instrument.MeterRegistry"
+                    + " but was: " + meterRegistry.getClass().getName());
         }
         return new MicrometerReservationMetrics(meterRegistry, backend);
     }
 
-    private static boolean isMicrometerAvailable() {
+    private static Class<?> micrometerRegistryClass() {
         try {
-            Class.forName("io.micrometer.core.instrument.MeterRegistry");
-            return true;
+            return Class.forName("io.micrometer.core.instrument.MeterRegistry");
         } catch (ClassNotFoundException e) {
-            return false;
+            return null;
         }
     }
 }
