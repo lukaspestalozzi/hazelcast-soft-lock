@@ -25,7 +25,7 @@ public interface ReservationMetrics {
      * Otherwise returns a no-op.
      *
      * @param meterRegistry a {@code io.micrometer.core.instrument.MeterRegistry}, or null
-     * @param backend backend identifier tag (e.g. "hazelcast", "oracle")
+     * @param backend backend identifier tag (e.g. "hazelcast")
      * @return a metrics instance, never null
      * @throws IllegalArgumentException if Micrometer is on the classpath but
      *         {@code meterRegistry} is not a MeterRegistry instance

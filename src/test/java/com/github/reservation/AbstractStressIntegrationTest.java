@@ -23,7 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * concurrency levels (~100 requests/second). Each test proves a specific
  * correctness or resilience property under sustained parallel load.</p>
  *
- * <p>Subclasses provide the specific backend (Hazelcast or JDBC) via
+ * <p>Subclasses provide the specific backend via
  * {@link #createManager(String, Duration)}.</p>
  */
 public abstract class AbstractStressIntegrationTest {
