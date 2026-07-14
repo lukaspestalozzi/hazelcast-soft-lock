@@ -227,8 +227,8 @@ The `ReservationException` hierarchy extends `RuntimeException` because the
 |--------|--------|--------|
 | `lock()` | `ReservationAcquisitionException` | Network/backend issues |
 | `lockInterruptibly()` | `InterruptedException`, `ReservationAcquisitionException` | Interruption, infrastructure issues |
-| `tryLock()` | (none - returns boolean) | Non-blocking, failure = false |
-| `tryLock(time, unit)` | `InterruptedException` | Timeout = false, interruption = exception |
+| `tryLock()` | `ReservationAcquisitionException` | Held by another = false; backend error = exception; interrupt = false with flag restored |
+| `tryLock(time, unit)` | `InterruptedException`, `ReservationAcquisitionException` | Timeout = false; interruption or backend error = exception |
 | `unlock()` | `ReservationExpiredException`, `IllegalMonitorStateException` | Lease expired / not held |
 | `newCondition()` | `UnsupportedOperationException` | Not supported |
 
@@ -365,7 +365,6 @@ Declared in `pom.xml` (authoritative). Summary:
 4. **Lock querying**: Ability to list all locks in a domain?
 5. **Additional backends**: e.g. a JDBC/database-backed implementation via the existing abstractions?
 6. **Multi-datacenter**: Support for geo-distributed locking?
-7. **`tryLock()` error semantics**: currently swallows backend errors (returns false) while `tryLock(timeout)` rethrows — align?
 
 ---
 
