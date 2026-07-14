@@ -18,17 +18,8 @@ public final class HoldTracker {
      * Mutable hold state for one (thread, reservation key) pair.
      */
     public static final class Hold {
-        private String holder;
         private Instant acquiredAt;
         private int count;
-
-        public String getHolder() {
-            return holder;
-        }
-
-        public void setHolder(String holder) {
-            this.holder = holder;
-        }
 
         public Instant getAcquiredAt() {
             return acquiredAt;

@@ -8,22 +8,21 @@ import java.time.Duration;
 
 /**
  * Micrometer-backed implementation of {@link ReservationMetrics}.
- *
- * <p>This class is only loaded when Micrometer is on the classpath,
- * guarded by the check in {@link ReservationMetrics#create(Object, String)}.</p>
  */
 final class MicrometerReservationMetrics implements ReservationMetrics {
 
     private final MeterRegistry registry;
     private final String backend;
+    private final String domain;
 
-    MicrometerReservationMetrics(Object meterRegistry, String backend) {
-        this.registry = (MeterRegistry) meterRegistry;
+    MicrometerReservationMetrics(MeterRegistry registry, String backend, String domain) {
+        this.registry = registry;
         this.backend = backend;
+        this.domain = domain;
     }
 
     @Override
-    public void recordAcquisition(String domain, Duration elapsed, String result) {
+    public void recordAcquisition(Duration elapsed, String result) {
         Timer.builder("reservation.acquire")
             .description("Time to acquire reservation")
             .tag("domain", domain)
@@ -34,7 +33,7 @@ final class MicrometerReservationMetrics implements ReservationMetrics {
     }
 
     @Override
-    public void recordAcquisitionAttempt(String domain, boolean success) {
+    public void recordAcquisitionAttempt(boolean success) {
         Counter.builder("reservation.acquire.attempts")
             .description("Number of acquisition attempts")
             .tag("domain", domain)
@@ -45,7 +44,7 @@ final class MicrometerReservationMetrics implements ReservationMetrics {
     }
 
     @Override
-    public void recordHeldTime(String domain, Duration elapsed) {
+    public void recordHeldTime(Duration elapsed) {
         Timer.builder("reservation.held.time")
             .description("Time reservation was held")
             .tag("domain", domain)
@@ -55,7 +54,7 @@ final class MicrometerReservationMetrics implements ReservationMetrics {
     }
 
     @Override
-    public void recordExpiration(String domain) {
+    public void recordExpiration() {
         Counter.builder("reservation.expired")
             .description("Number of reservations that expired before unlock")
             .tag("domain", domain)

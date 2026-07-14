@@ -1,10 +1,12 @@
 package com.github.reservation.hazelcast;
 
 import com.github.reservation.AbstractReservationManagerTest;
+import com.github.reservation.Reservation;
 import com.github.reservation.ReservationManager;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.*;
 
 import java.time.Duration;
@@ -147,5 +149,39 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
             ReservationManager.hazelcast(hazelcast).build()
         ).isInstanceOf(IllegalStateException.class)
          .hasMessageContaining("domain");
+    }
+
+    @Test
+    void shouldRecordMetricsWhenRegistryConfigured() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        String mapPrefix = "metrics-test-" + UUID.randomUUID().toString().substring(0, 8);
+        mapNamesToCleanup.add(mapPrefix + "-metrics-domain");
+
+        ReservationManager metricsManager = ReservationManager.hazelcast(hazelcast)
+            .domain("metrics-domain")
+            .leaseTime(Duration.ofSeconds(5))
+            .mapPrefix(mapPrefix)
+            .meterRegistry(registry)
+            .build();
+
+        try {
+            Reservation reservation = metricsManager.getReservation("metered");
+            reservation.lock();
+            reservation.unlock();
+
+            assertThat(registry.get("reservation.acquire")
+                .tag("domain", "metrics-domain")
+                .tag("backend", "hazelcast")
+                .tag("result", "acquired")
+                .timer().count()).isEqualTo(1);
+            assertThat(registry.get("reservation.acquire.attempts")
+                .tag("result", "success")
+                .counter().count()).isEqualTo(1.0);
+            assertThat(registry.get("reservation.held.time")
+                .tag("domain", "metrics-domain")
+                .timer().count()).isEqualTo(1);
+        } finally {
+            metricsManager.close();
+        }
     }
 }

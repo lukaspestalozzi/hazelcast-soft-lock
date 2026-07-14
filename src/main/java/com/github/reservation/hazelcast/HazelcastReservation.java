@@ -57,13 +57,6 @@ final class HazelcastReservation implements Reservation {
     }
 
     @Override
-    public String getReservationKey() {
-        // In single-domain mode, the key is just the identifier
-        // (the domain isolation is handled by using separate maps)
-        return identifier;
-    }
-
-    @Override
     public Duration getRemainingLeaseTime() {
         HoldTracker.Hold hold = holdTracker.get(identifier);
         if (hold == null) {
@@ -151,13 +144,13 @@ final class HazelcastReservation implements Reservation {
             log.debug("Acquired reservation (interruptibly): {}", identifier);
 
         } catch (InterruptedException e) {
-            metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+            metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
             throw e;
         } catch (Exception e) {
             // The client-side proxy wraps interrupts in HazelcastException instead of
             // throwing InterruptedException like the member-side proxy does
             if (causedByInterrupt(e) || Thread.interrupted()) {
-                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+                metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
                 throw interruptedException(e);
             }
             recordError(start);
@@ -179,8 +172,8 @@ final class HazelcastReservation implements Reservation {
 
                 log.debug("Try-locked reservation: {}", identifier);
             } else {
-                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "unavailable");
-                metrics.recordAcquisitionAttempt(domain, false);
+                metrics.recordAcquisition(Duration.between(start, Instant.now()), "unavailable");
+                metrics.recordAcquisitionAttempt(false);
 
                 log.debug("Try-lock failed, reservation unavailable: {}", identifier);
             }
@@ -189,12 +182,12 @@ final class HazelcastReservation implements Reservation {
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+            metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
             return false;
         } catch (Exception e) {
             if (causedByInterrupt(e)) {
                 Thread.currentThread().interrupt();
-                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+                metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
                 return false;
             }
             recordError(start);
@@ -219,8 +212,8 @@ final class HazelcastReservation implements Reservation {
 
                 log.debug("Try-locked reservation with timeout: {}", identifier);
             } else {
-                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "timeout");
-                metrics.recordAcquisitionAttempt(domain, false);
+                metrics.recordAcquisition(Duration.between(start, Instant.now()), "timeout");
+                metrics.recordAcquisitionAttempt(false);
 
                 log.debug("Try-lock timed out for reservation: {}", identifier);
             }
@@ -228,11 +221,11 @@ final class HazelcastReservation implements Reservation {
             return acquired;
 
         } catch (InterruptedException e) {
-            metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+            metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
             throw e;
         } catch (Exception e) {
             if (causedByInterrupt(e) || Thread.interrupted()) {
-                metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "interrupted");
+                metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
                 throw interruptedException(e);
             }
             throw e instanceof RuntimeException re
@@ -268,7 +261,7 @@ final class HazelcastReservation implements Reservation {
 
             hold.setCount(hold.getCount() - 1);
             if (hold.getCount() == 0) {
-                metrics.recordHeldTime(domain, Duration.between(hold.getAcquiredAt(), Instant.now()));
+                metrics.recordHeldTime(Duration.between(hold.getAcquiredAt(), Instant.now()));
                 holdTracker.remove(identifier);
             }
 
@@ -277,7 +270,7 @@ final class HazelcastReservation implements Reservation {
         } catch (IllegalMonitorStateException e) {
             // We tracked a hold but the cluster no longer recognizes it - the lease expired
             holdTracker.remove(identifier);
-            metrics.recordExpiration(domain);
+            metrics.recordExpiration();
 
             log.warn("Unlock failed for reservation {} - lease expired", identifier);
 
@@ -298,8 +291,8 @@ final class HazelcastReservation implements Reservation {
         hold.setCount(hold.getCount() + 1);
         hold.setAcquiredAt(Instant.now());
 
-        metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "acquired");
-        metrics.recordAcquisitionAttempt(domain, true);
+        metrics.recordAcquisition(Duration.between(start, Instant.now()), "acquired");
+        metrics.recordAcquisitionAttempt(true);
     }
 
     private boolean leaseLapsed(HoldTracker.Hold hold) {
@@ -307,8 +300,8 @@ final class HazelcastReservation implements Reservation {
     }
 
     private void recordError(Instant start) {
-        metrics.recordAcquisition(domain, Duration.between(start, Instant.now()), "error");
-        metrics.recordAcquisitionAttempt(domain, false);
+        metrics.recordAcquisition(Duration.between(start, Instant.now()), "error");
+        metrics.recordAcquisitionAttempt(false);
     }
 
     private void storeDebugValue() {

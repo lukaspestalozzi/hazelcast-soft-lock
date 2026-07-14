@@ -1,56 +1,40 @@
 package com.github.reservation.internal;
 
+import io.micrometer.core.instrument.MeterRegistry;
+
 import java.time.Duration;
 
 /**
- * Metrics interface for reservation operations. Decoupled from Micrometer
- * so the library works without Micrometer on the classpath.
+ * Metrics interface for reservation operations. Micrometer is an optional
+ * dependency: this interface is only linked against it in the static factory,
+ * and the Micrometer-backed implementation is only instantiated when a
+ * registry is provided.
  *
- * <p>Use {@link #create(Object, String)} to obtain an instance. Pass a
- * {@code MeterRegistry} to enable metrics, or {@code null} for no-op.</p>
+ * <p>Instances are scoped to one manager, so backend and domain are fixed
+ * at creation time.</p>
  */
 public interface ReservationMetrics {
 
-    void recordAcquisition(String domain, Duration elapsed, String result);
+    void recordAcquisition(Duration elapsed, String result);
 
-    void recordAcquisitionAttempt(String domain, boolean success);
+    void recordAcquisitionAttempt(boolean success);
 
-    void recordHeldTime(String domain, Duration elapsed);
+    void recordHeldTime(Duration elapsed);
 
-    void recordExpiration(String domain);
+    void recordExpiration();
 
     /**
-     * Creates a ReservationMetrics instance. If {@code meterRegistry} is non-null
-     * and Micrometer is on the classpath, returns a Micrometer-backed implementation.
-     * Otherwise returns a no-op.
+     * Creates a ReservationMetrics instance for one manager.
      *
-     * @param meterRegistry a {@code io.micrometer.core.instrument.MeterRegistry}, or null
+     * @param meterRegistry the registry to record to, or null for no-op
      * @param backend backend identifier tag (e.g. "hazelcast")
+     * @param domain the manager's domain tag
      * @return a metrics instance, never null
-     * @throws IllegalArgumentException if Micrometer is on the classpath but
-     *         {@code meterRegistry} is not a MeterRegistry instance
      */
-    static ReservationMetrics create(Object meterRegistry, String backend) {
+    static ReservationMetrics create(MeterRegistry meterRegistry, String backend, String domain) {
         if (meterRegistry == null) {
             return NoOpReservationMetrics.INSTANCE;
         }
-        Class<?> registryClass = micrometerRegistryClass();
-        if (registryClass == null) {
-            return NoOpReservationMetrics.INSTANCE;
-        }
-        if (!registryClass.isInstance(meterRegistry)) {
-            throw new IllegalArgumentException(
-                "meterRegistry must be an instance of io.micrometer.core.instrument.MeterRegistry"
-                    + " but was: " + meterRegistry.getClass().getName());
-        }
-        return new MicrometerReservationMetrics(meterRegistry, backend);
-    }
-
-    private static Class<?> micrometerRegistryClass() {
-        try {
-            return Class.forName("io.micrometer.core.instrument.MeterRegistry");
-        } catch (ClassNotFoundException e) {
-            return null;
-        }
+        return new MicrometerReservationMetrics(meterRegistry, backend, domain);
     }
 }
