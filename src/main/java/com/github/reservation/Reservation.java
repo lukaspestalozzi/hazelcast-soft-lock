@@ -72,7 +72,12 @@ public interface Reservation extends Lock {
     /**
      * Acquires the reservation only if it is free at the time of invocation.
      *
-     * @return true if the reservation was acquired, false otherwise
+     * <p>If the current thread is interrupted, the interrupt flag is restored
+     * and {@code false} is returned (this method does not declare
+     * {@link InterruptedException}).</p>
+     *
+     * @return true if the reservation was acquired, false if it is held by another
+     * @throws ReservationAcquisitionException if a backend error prevents acquisition
      */
     @Override
     boolean tryLock();
@@ -84,6 +89,7 @@ public interface Reservation extends Lock {
      * @param unit the time unit of the time argument
      * @return true if the reservation was acquired, false if the waiting time elapsed
      * @throws InterruptedException if the current thread is interrupted
+     * @throws ReservationAcquisitionException if a backend error prevents acquisition
      */
     @Override
     boolean tryLock(long time, TimeUnit unit) throws InterruptedException;

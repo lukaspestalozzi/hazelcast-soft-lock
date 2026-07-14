@@ -2,6 +2,7 @@ package com.github.reservation.hazelcast;
 
 import com.github.reservation.AbstractReservationManagerTest;
 import com.github.reservation.Reservation;
+import com.github.reservation.ReservationAcquisitionException;
 import com.github.reservation.ReservationManager;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
@@ -13,6 +14,7 @@ import java.time.Duration;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -149,6 +151,32 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
             ReservationManager.hazelcast(hazelcast).build()
         ).isInstanceOf(IllegalStateException.class)
          .hasMessageContaining("domain");
+    }
+
+    @Test
+    void tryLockShouldThrowOnBackendError() throws Exception {
+        // Dedicated instance so shutting it down doesn't affect the shared member
+        Config config = new Config();
+        config.setClusterName("backend-error-" + UUID.randomUUID());
+        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
+        HazelcastInstance doomed = Hazelcast.newHazelcastInstance(config);
+
+        ReservationManager doomedManager = ReservationManager.hazelcast(doomed)
+            .domain("doomed")
+            .build();
+        Reservation reservation = doomedManager.getReservation("unreachable");
+
+        doomed.shutdown();
+
+        try {
+            assertThatThrownBy(reservation::tryLock)
+                .isInstanceOf(ReservationAcquisitionException.class);
+            assertThatThrownBy(() -> reservation.tryLock(100, TimeUnit.MILLISECONDS))
+                .isInstanceOf(ReservationAcquisitionException.class);
+        } finally {
+            doomedManager.close();
+        }
     }
 
     @Test

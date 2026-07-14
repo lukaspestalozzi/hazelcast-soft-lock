@@ -191,8 +191,8 @@ final class HazelcastReservation implements Reservation {
                 return false;
             }
             recordError(start);
-            log.warn("Error during tryLock for {}: {}", identifier, e.getMessage());
-            return false;
+            throw new ReservationAcquisitionException(domain, identifier,
+                "Failed to acquire reservation", e);
         }
     }
 
@@ -228,10 +228,9 @@ final class HazelcastReservation implements Reservation {
                 metrics.recordAcquisition(Duration.between(start, Instant.now()), "interrupted");
                 throw interruptedException(e);
             }
-            throw e instanceof RuntimeException re
-                ? re
-                : new ReservationAcquisitionException(domain, identifier,
-                    "Failed to acquire reservation", e);
+            recordError(start);
+            throw new ReservationAcquisitionException(domain, identifier,
+                "Failed to acquire reservation", e);
         }
     }
 
