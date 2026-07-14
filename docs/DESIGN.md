@@ -12,15 +12,14 @@
 2. [Architecture](#2-architecture)
 3. [API Design](#3-api-design)
 4. [Hazelcast Implementation](#4-hazelcast-implementation)
-5. [Oracle Implementation](#5-oracle-implementation)
-6. [Configuration](#6-configuration)
-7. [Error Handling](#7-error-handling)
-8. [Observability](#8-observability)
-9. [Testing Strategy](#9-testing-strategy)
-10. [Performance Considerations](#10-performance-considerations)
-11. [Project Structure](#11-project-structure)
-12. [Dependencies](#12-dependencies)
-13. [Roadmap](#13-roadmap)
+5. [Configuration](#5-configuration)
+6. [Error Handling](#6-error-handling)
+7. [Observability](#7-observability)
+8. [Testing Strategy](#8-testing-strategy)
+9. [Performance Considerations](#9-performance-considerations)
+10. [Project Structure](#10-project-structure)
+11. [Dependencies](#11-dependencies)
+12. [Roadmap](#12-roadmap)
 
 ---
 
@@ -30,11 +29,7 @@
 
 This library provides a **Reservation** (soft-lock) implementation for distributed Java applications. A reservation is a distributed lock that **automatically expires** after a configurable lease time (default: 1 minute), preventing deadlocks caused by crashed processes or forgotten unlocks.
 
-The library supports **two backend implementations**:
-- **Hazelcast**: Using `IMap.lock()` with native lease time support
-- **Oracle Database**: Using a custom lock table with TTL-based expiration
-
-Both implementations share the same API and behavioral guarantees.
+The library ships a single backend implementation, **Hazelcast**, using `IMap.lock()` with native lease time support. The public API is backend-agnostic so additional backends can be added later; any future implementation must share the same API and behavioral guarantees.
 
 ### 1.2 Key Features
 
@@ -42,12 +37,12 @@ Both implementations share the same API and behavioral guarantees.
 - Automatic lock expiration via configurable lease time
 - **Single-domain managers**: Each ReservationManager handles one domain
 - Lock identity composed of **domain** (from manager) and **identifier** (per reservation)
-- Two interchangeable backends: Hazelcast and Oracle DB
-- **Domain isolation**: Hazelcast uses separate IMaps per domain; Oracle uses composite keys
+- Backend-agnostic API with Hazelcast as the provided backend
+- **Domain isolation**: separate IMaps per domain
 - Micrometer metrics integration for observability
 - Reentrant locking support
 - Dedicated exception hierarchy (unchecked, as required by the `Lock` interface)
-- Shared test suite validating both implementations
+- Shared test suite validating any implementation against the same contract
 
 ### 1.3 Design Decisions Summary
 
@@ -57,19 +52,15 @@ Both implementations share the same API and behavioral guarantees.
 | Lock interface | `Reservation extends Lock` | Compatibility + additional methods |
 | `newCondition()` | `UnsupportedOperationException` | Not feasible for distributed locks |
 | Domain per manager | Single domain per ReservationManager | Cleaner API, explicit isolation |
-| Domain isolation | Hazelcast: separate IMap; Oracle: composite key | Backend-appropriate isolation |
-| Key format | Oracle: `{domain}::{identifier}` | Simple, readable, debuggable |
+| Domain isolation | Separate IMap per domain | Backend-appropriate isolation |
 | Hazelcast map naming | `{mapPrefix}-{domain}` | Domain isolation via separate maps |
 | Lease time config | Global default on manager | Simplicity with configurability |
 | Thread affinity | Strict (per-thread ownership) | Consistency with Lock contract |
 | Reentrancy | Supported | Same thread can lock multiple times |
 | Error handling | Dedicated unchecked exception hierarchy | `Lock` methods cannot declare checked exceptions |
 | Project structure | Single module | Simpler build, single artifact |
-| Testing | Abstract base test class | Shared tests for both implementations |
+| Testing | Abstract base test class | Shared contract tests for all implementations |
 | Hazelcast value | String with debug info | Debuggability with low overhead |
-| Oracle mechanism | Custom table (pluggable strategy) | Flexibility for experimentation |
-| Oracle connection | DataSource injection | Standard enterprise pattern |
-| Oracle schema | User-managed | Enterprise DBA control |
 
 ---
 
@@ -100,30 +91,25 @@ Both implementations share the same API and behavioral guarantees.
 │         Additional: identifier, reservationKey, remainingLeaseTime       │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
-                    ┌───────────────┴───────────────┐
-                    ▼                               ▼
-┌───────────────────────────────┐   ┌───────────────────────────────────┐
-│   HazelcastReservationManager │   │     OracleReservationManager      │
-│   ┌─────────────────────────┐ │   │   ┌─────────────────────────────┐ │
-│   │ IMap<String, String>    │ │   │   │ LockingStrategy (pluggable) │ │
-│   │ - lock(key, lease)      │ │   │   │ - TableBasedLockingStrategy │ │
-│   │ - tryLock(...)          │ │   │   │ - (future strategies)       │ │
-│   │ - unlock(key)           │ │   │   └─────────────────────────────┘ │
-│   │ - value: debug string   │ │   │   ┌─────────────────────────────┐ │
-│   └─────────────────────────┘ │   │   │ DataSource                  │ │
-└───────────────────────────────┘   │   │ - connection per operation  │ │
-              │                     │   └─────────────────────────────┘ │
-              ▼                     └───────────────────────────────────┘
-┌───────────────────────────────┐                   │
-│     Hazelcast Cluster         │                   ▼
-└───────────────────────────────┘   ┌───────────────────────────────────┐
-                                    │        Oracle Database            │
-                                    │   ┌─────────────────────────────┐ │
-                                    │   │ RESERVATION_LOCKS table     │ │
-                                    │   │ (user-managed schema)       │ │
-                                    │   └─────────────────────────────┘ │
-                                    └───────────────────────────────────┘
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │   HazelcastReservationManager │
+                    │   ┌─────────────────────────┐ │
+                    │   │ IMap<String, String>    │ │
+                    │   │ - lock(key, lease)      │ │
+                    │   │ - tryLock(...)          │ │
+                    │   │ - unlock(key)           │ │
+                    │   │ - value: debug string   │ │
+                    │   └─────────────────────────┘ │
+                    └───────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │     Hazelcast Cluster         │
+                    └───────────────────────────────┘
 ```
+
+Additional backends can be added by implementing `Reservation` and `ReservationManager` against a different storage layer.
 
 ### 2.2 Component Responsibilities
 
@@ -132,8 +118,6 @@ Both implementations share the same API and behavioral guarantees.
 | `ReservationManager` | Interface for creating reservations for a single domain |
 | `Reservation` | Interface for individual lock instance, extends Lock |
 | `HazelcastReservationManager` | Hazelcast-backed implementation (uses domain-specific IMap) |
-| `OracleReservationManager` | Oracle-backed implementation (uses composite keys) |
-| `LockingStrategy` | Pluggable Oracle locking mechanism (Strategy pattern) |
 | `ReservationMetrics` | Micrometer metrics registration and recording |
 
 ### 2.3 Reservation Lifecycle
@@ -208,7 +192,6 @@ public interface Reservation extends Lock {
     /**
      * Returns the key used for this reservation in the underlying storage.
      * <p>For Hazelcast: just the identifier (domain isolation via separate maps).
-     * <p>For Oracle: composite key "{domain}::{identifier}".
      *
      * @return the reservation key string, never null
      */
@@ -315,8 +298,8 @@ import java.time.Duration;
 /**
  * Factory and manager for {@link Reservation} instances within a single domain.
  *
- * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle),
- * a single domain, and configuration. Create separate managers for different domains.</p>
+ * <p>A ReservationManager is bound to a specific backend, a single domain,
+ * and configuration. Create separate managers for different domains.</p>
  *
  * <p>Example usage with Hazelcast:</p>
  * <pre>{@code
@@ -334,15 +317,6 @@ import java.time.Duration;
  * } finally {
  *     reservation.unlock();
  * }
- * }</pre>
- *
- * <p>Example usage with Oracle:</p>
- * <pre>{@code
- * DataSource dataSource = ...;
- * ReservationManager manager = ReservationManager.oracle(dataSource)
- *     .domain("orders")
- *     .leaseTime(Duration.ofMinutes(2))
- *     .build();
  * }</pre>
  *
  * <p>Multiple domains require multiple managers:</p>
@@ -369,17 +343,6 @@ public interface ReservationManager extends Closeable {
     static HazelcastReservationManagerBuilder hazelcast(
             com.hazelcast.core.HazelcastInstance hazelcastInstance) {
         return new HazelcastReservationManagerBuilder(hazelcastInstance);
-    }
-
-    /**
-     * Creates a new builder for an Oracle-backed ReservationManager.
-     *
-     * @param dataSource the DataSource to use for database connections
-     * @return a new builder instance
-     * @throws NullPointerException if dataSource is null
-     */
-    static OracleReservationManagerBuilder oracle(javax.sql.DataSource dataSource) {
-        return new OracleReservationManagerBuilder(dataSource);
     }
 
     /**
@@ -411,7 +374,7 @@ public interface ReservationManager extends Closeable {
     /**
      * Closes this manager and releases associated resources.
      *
-     * <p>Note: This does NOT close the underlying Hazelcast instance or DataSource,
+     * <p>Note: This does NOT close the underlying Hazelcast instance,
      * nor does it release any currently held reservations.</p>
      */
     @Override
@@ -624,78 +587,6 @@ public final class HazelcastReservationManagerBuilder
 }
 ```
 
-#### 3.3.3 Oracle Builder
-
-```java
-package com.github.reservation.oracle;
-
-import com.github.reservation.AbstractReservationManagerBuilder;
-import com.github.reservation.ReservationManager;
-import javax.sql.DataSource;
-import java.util.Objects;
-
-/**
- * Builder for creating Oracle-backed {@link ReservationManager} instances.
- *
- * <p>Each manager is bound to a single domain. Reservation keys are stored
- * as composite keys in the format "{domain}::{identifier}".</p>
- */
-public final class OracleReservationManagerBuilder
-        extends AbstractReservationManagerBuilder<OracleReservationManagerBuilder> {
-
-    private final DataSource dataSource;
-    private String tableName = "RESERVATION_LOCKS";
-    private LockingStrategy lockingStrategy = null; // null = use default
-
-    OracleReservationManagerBuilder(DataSource dataSource) {
-        this.dataSource = Objects.requireNonNull(dataSource,
-            "dataSource must not be null");
-    }
-
-    /**
-     * Sets the table name for storing reservations. Default: "RESERVATION_LOCKS"
-     *
-     * <p>Note: The table must be created by the user. See documentation for required schema.</p>
-     */
-    public OracleReservationManagerBuilder tableName(String tableName) {
-        Objects.requireNonNull(tableName, "tableName must not be null");
-        if (tableName.isEmpty()) {
-            throw new IllegalArgumentException("tableName must not be empty");
-        }
-        this.tableName = tableName;
-        return this;
-    }
-
-    /**
-     * Sets a custom locking strategy. Default: {@link TableBasedLockingStrategy}
-     *
-     * <p>This allows experimentation with different locking mechanisms.</p>
-     */
-    public OracleReservationManagerBuilder lockingStrategy(LockingStrategy lockingStrategy) {
-        this.lockingStrategy = Objects.requireNonNull(lockingStrategy,
-            "lockingStrategy must not be null");
-        return this;
-    }
-
-    @Override
-    public ReservationManager build() {
-        validate();  // Ensures domain is set
-        LockingStrategy strategy = lockingStrategy != null
-            ? lockingStrategy
-            : new TableBasedLockingStrategy(dataSource, tableName);
-
-        return new OracleReservationManager(
-            dataSource,
-            strategy,
-            domain,
-            leaseTime,
-            tableName,
-            meterRegistry
-        );
-    }
-}
-```
-
 ---
 
 ## 4. Hazelcast Implementation
@@ -824,380 +715,9 @@ class HazelcastReservation implements Reservation {
 
 ---
 
-## 5. Oracle Implementation
+## 5. Configuration
 
-### 5.1 Overview
-
-The Oracle implementation uses a custom lock table with polling-based acquisition. The locking mechanism is designed as a **pluggable strategy** to allow experimentation with different approaches.
-
-### 5.2 Locking Strategy Interface
-
-```java
-package com.github.reservation.oracle;
-
-import java.time.Duration;
-import java.time.Instant;
-import java.util.Optional;
-
-/**
- * Strategy interface for Oracle-based locking mechanisms.
- *
- * <p>This interface allows experimentation with different locking approaches
- * without changing the rest of the implementation.</p>
- *
- * <p>Implementations must be thread-safe.</p>
- */
-public interface LockingStrategy {
-
-    /**
-     * Attempts to acquire a lock.
-     *
-     * @param reservationKey the composite key (domain::identifier)
-     * @param holder unique identifier for the lock holder (thread@host)
-     * @param leaseTime how long the lock should be held before auto-expiry
-     * @return true if lock was acquired, false if already held by another
-     * @throws LockingException if a database error occurs
-     */
-    boolean tryAcquire(String reservationKey, String holder, Duration leaseTime)
-        throws LockingException;
-
-    /**
-     * Releases a lock.
-     *
-     * @param reservationKey the composite key
-     * @param holder the holder that acquired the lock
-     * @return true if lock was released, false if not held or expired
-     * @throws LockingException if a database error occurs
-     */
-    boolean release(String reservationKey, String holder) throws LockingException;
-
-    /**
-     * Forcefully releases a lock regardless of owner.
-     *
-     * @param reservationKey the composite key
-     * @throws LockingException if a database error occurs
-     */
-    void forceRelease(String reservationKey) throws LockingException;
-
-    /**
-     * Checks if a lock is currently held (and not expired).
-     *
-     * @param reservationKey the composite key
-     * @return true if lock is held, false otherwise
-     * @throws LockingException if a database error occurs
-     */
-    boolean isLocked(String reservationKey) throws LockingException;
-
-    /**
-     * Gets lock information if held.
-     *
-     * @param reservationKey the composite key
-     * @return lock info if held, empty if not
-     * @throws LockingException if a database error occurs
-     */
-    Optional<LockInfo> getLockInfo(String reservationKey) throws LockingException;
-
-    /**
-     * Information about a held lock.
-     */
-    record LockInfo(
-        String holder,
-        Instant acquiredAt,
-        Instant expiresAt
-    ) {
-        public Duration remainingLeaseTime() {
-            Duration remaining = Duration.between(Instant.now(), expiresAt);
-            return remaining.isNegative() ? Duration.ZERO : remaining;
-        }
-    }
-}
-```
-
-### 5.3 Table-Based Locking Strategy
-
-```java
-package com.github.reservation.oracle;
-
-import javax.sql.DataSource;
-import java.sql.*;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.Optional;
-
-/**
- * Default locking strategy using a custom table with TTL-based expiration.
- *
- * <p>This strategy uses optimistic locking: successful INSERT = lock acquired,
- * constraint violation = lock already held.</p>
- *
- * <p>Expired locks are cleaned up lazily on acquisition attempts.</p>
- */
-public class TableBasedLockingStrategy implements LockingStrategy {
-
-    private final DataSource dataSource;
-    private final String tableName;
-
-    // SQL statements (initialized in constructor based on tableName)
-    private final String INSERT_SQL;
-    private final String DELETE_SQL;
-    private final String DELETE_FORCE_SQL;
-    private final String SELECT_SQL;
-    private final String CLEANUP_EXPIRED_SQL;
-
-    public TableBasedLockingStrategy(DataSource dataSource, String tableName) {
-        this.dataSource = dataSource;
-        this.tableName = tableName;
-
-        // Initialize SQL with table name
-        INSERT_SQL = String.format(
-            "INSERT INTO %s (reservation_key, holder, acquired_at, expires_at) " +
-            "VALUES (?, ?, ?, ?)", tableName);
-        DELETE_SQL = String.format(
-            "DELETE FROM %s WHERE reservation_key = ? AND holder = ?", tableName);
-        DELETE_FORCE_SQL = String.format(
-            "DELETE FROM %s WHERE reservation_key = ?", tableName);
-        SELECT_SQL = String.format(
-            "SELECT holder, acquired_at, expires_at FROM %s " +
-            "WHERE reservation_key = ? AND expires_at > SYSTIMESTAMP", tableName);
-        CLEANUP_EXPIRED_SQL = String.format(
-            "DELETE FROM %s WHERE reservation_key = ? AND expires_at <= SYSTIMESTAMP", tableName);
-    }
-
-    @Override
-    public boolean tryAcquire(String reservationKey, String holder, Duration leaseTime)
-            throws LockingException {
-        try (Connection conn = dataSource.getConnection()) {
-            conn.setAutoCommit(false);
-            try {
-                // First, clean up any expired lock for this key
-                cleanupExpired(conn, reservationKey);
-
-                // Try to insert new lock
-                Instant now = Instant.now();
-                Instant expiresAt = now.plus(leaseTime);
-
-                try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
-                    ps.setString(1, reservationKey);
-                    ps.setString(2, holder);
-                    ps.setTimestamp(3, Timestamp.from(now));
-                    ps.setTimestamp(4, Timestamp.from(expiresAt));
-                    ps.executeUpdate();
-                }
-
-                conn.commit();
-                return true;
-
-            } catch (SQLIntegrityConstraintViolationException e) {
-                // Lock already held by another (unique constraint violation)
-                conn.rollback();
-                return false;
-            } catch (SQLException e) {
-                conn.rollback();
-                throw e;
-            }
-        } catch (SQLException e) {
-            throw new LockingException("Failed to acquire lock: " + reservationKey, e);
-        }
-    }
-
-    @Override
-    public boolean release(String reservationKey, String holder) throws LockingException {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(DELETE_SQL)) {
-            ps.setString(1, reservationKey);
-            ps.setString(2, holder);
-            int deleted = ps.executeUpdate();
-            return deleted > 0;
-        } catch (SQLException e) {
-            throw new LockingException("Failed to release lock: " + reservationKey, e);
-        }
-    }
-
-    @Override
-    public void forceRelease(String reservationKey) throws LockingException {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(DELETE_FORCE_SQL)) {
-            ps.setString(1, reservationKey);
-            ps.executeUpdate();
-        } catch (SQLException e) {
-            throw new LockingException("Failed to force release lock: " + reservationKey, e);
-        }
-    }
-
-    @Override
-    public boolean isLocked(String reservationKey) throws LockingException {
-        return getLockInfo(reservationKey).isPresent();
-    }
-
-    @Override
-    public Optional<LockInfo> getLockInfo(String reservationKey) throws LockingException {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(SELECT_SQL)) {
-            ps.setString(1, reservationKey);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return Optional.of(new LockInfo(
-                        rs.getString("holder"),
-                        rs.getTimestamp("acquired_at").toInstant(),
-                        rs.getTimestamp("expires_at").toInstant()
-                    ));
-                }
-                return Optional.empty();
-            }
-        } catch (SQLException e) {
-            throw new LockingException("Failed to get lock info: " + reservationKey, e);
-        }
-    }
-
-    private void cleanupExpired(Connection conn, String reservationKey) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(CLEANUP_EXPIRED_SQL)) {
-            ps.setString(1, reservationKey);
-            ps.executeUpdate();
-        }
-    }
-}
-```
-
-### 5.4 Required Database Schema
-
-The user must create the following table (library documents this, does not auto-create):
-
-```sql
--- Required schema for reservation locks
--- Create this table before using the Oracle ReservationManager
-
-CREATE TABLE RESERVATION_LOCKS (
-    reservation_key  VARCHAR2(512)  NOT NULL,
-    holder           VARCHAR2(256)  NOT NULL,
-    acquired_at      TIMESTAMP      NOT NULL,
-    expires_at       TIMESTAMP      NOT NULL,
-
-    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
-);
-
--- Index for cleanup queries
-CREATE INDEX idx_reservation_locks_expires ON RESERVATION_LOCKS (expires_at);
-
--- Optional: Add comments
-COMMENT ON TABLE RESERVATION_LOCKS IS 'Distributed reservation locks with automatic expiration';
-COMMENT ON COLUMN RESERVATION_LOCKS.reservation_key IS 'Composite key: domain::identifier';
-COMMENT ON COLUMN RESERVATION_LOCKS.holder IS 'Lock owner: thread@host';
-COMMENT ON COLUMN RESERVATION_LOCKS.acquired_at IS 'When the lock was acquired';
-COMMENT ON COLUMN RESERVATION_LOCKS.expires_at IS 'When the lock automatically expires';
-```
-
-### 5.5 Polling for Contended Locks
-
-When `lock()` (blocking) is called and the lock is held, the Oracle implementation polls:
-
-```java
-class OracleReservation implements Reservation {
-
-    private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
-    private static final Duration MAX_POLL_INTERVAL = Duration.ofSeconds(2);
-
-    @Override
-    public void lock() throws ReservationAcquisitionException {
-        String holder = buildHolder();
-        Duration pollInterval = POLL_INTERVAL;
-
-        while (true) {
-            try {
-                if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
-                    this.currentHolder = holder;
-                    return;
-                }
-
-                // Exponential backoff with cap
-                Thread.sleep(pollInterval.toMillis());
-                pollInterval = pollInterval.multipliedBy(2);
-                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
-                    pollInterval = MAX_POLL_INTERVAL;
-                }
-
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new ReservationAcquisitionException(domain, identifier,
-                    "Interrupted while waiting for reservation", e);
-            } catch (LockingException e) {
-                throw new ReservationAcquisitionException(domain, identifier,
-                    "Database error acquiring reservation", e);
-            }
-        }
-    }
-
-    @Override
-    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
-        String holder = buildHolder();
-        long deadline = System.nanoTime() + unit.toNanos(time);
-        Duration pollInterval = POLL_INTERVAL;
-
-        while (System.nanoTime() < deadline) {
-            try {
-                if (lockingStrategy.tryAcquire(reservationKey, holder, leaseTime)) {
-                    this.currentHolder = holder;
-                    return true;
-                }
-
-                long remainingNanos = deadline - System.nanoTime();
-                if (remainingNanos <= 0) {
-                    return false;
-                }
-
-                long sleepMillis = Math.min(pollInterval.toMillis(),
-                                            TimeUnit.NANOSECONDS.toMillis(remainingNanos));
-                Thread.sleep(sleepMillis);
-
-                pollInterval = pollInterval.multipliedBy(2);
-                if (pollInterval.compareTo(MAX_POLL_INTERVAL) > 0) {
-                    pollInterval = MAX_POLL_INTERVAL;
-                }
-
-            } catch (LockingException e) {
-                // Log and continue trying
-            }
-        }
-        return false;
-    }
-
-    private String buildHolder() {
-        String threadName = Thread.currentThread().getName();
-        String hostName = getHostName();
-        return threadName + "@" + hostName;
-    }
-}
-```
-
-### 5.6 Alternative Strategies (Future)
-
-The `LockingStrategy` interface allows future experimentation:
-
-```java
-// Possible future strategies:
-
-/**
- * Uses SELECT FOR UPDATE with SKIP LOCKED (Oracle 11g+).
- * Requires holding connection during lock.
- */
-class SelectForUpdateLockingStrategy implements LockingStrategy { }
-
-/**
- * Uses DBMS_LOCK package for session-scoped locks.
- * Requires EXECUTE privilege on DBMS_LOCK.
- */
-class DbmsLockLockingStrategy implements LockingStrategy { }
-
-/**
- * Uses Oracle AQ (Advanced Queuing) for lock coordination.
- */
-class AqBasedLockingStrategy implements LockingStrategy { }
-```
-
----
-
-## 6. Configuration
-
-### 6.1 Common Configuration Properties
+### 5.1 Common Configuration Properties
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -1205,20 +725,13 @@ class AqBasedLockingStrategy implements LockingStrategy { }
 | `leaseTime` | `Duration` | 1 minute | Time after which reservation auto-releases |
 | `meterRegistry` | `MeterRegistry` | `null` | Micrometer registry (null = no metrics) |
 
-### 6.2 Hazelcast-Specific Configuration
+### 5.2 Hazelcast-Specific Configuration
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `mapPrefix` | `String` | `reservations` | Prefix for IMap name (actual: `{prefix}-{domain}`) |
 
-### 6.3 Oracle-Specific Configuration
-
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `tableName` | `String` | `RESERVATION_LOCKS` | Database table name |
-| `lockingStrategy` | `LockingStrategy` | `TableBasedLockingStrategy` | Pluggable locking mechanism |
-
-### 6.4 Hazelcast Client Setup Example
+### 5.3 Hazelcast Client Setup Example
 
 ```java
 ClientConfig config = new ClientConfig();
@@ -1244,35 +757,14 @@ ReservationManager usersManager = ReservationManager.hazelcast(hz)
     .build();
 ```
 
-### 6.5 Oracle DataSource Setup Example
-
-```java
-// Using HikariCP
-HikariConfig hikariConfig = new HikariConfig();
-hikariConfig.setJdbcUrl("jdbc:oracle:thin:@//dbhost:1521/ORCL");
-hikariConfig.setUsername("app_user");
-hikariConfig.setPassword("secret");
-hikariConfig.setMaximumPoolSize(10);
-
-DataSource dataSource = new HikariDataSource(hikariConfig);
-
-// Create manager for "orders" domain
-ReservationManager manager = ReservationManager.oracle(dataSource)
-    .domain("orders")
-    .leaseTime(Duration.ofMinutes(2))
-    .tableName("MY_LOCKS")
-    .build();
-```
-
 ---
 
-## 7. Error Handling
+## 6. Error Handling
 
-### 7.1 Exception Strategy
+### 6.1 Exception Strategy
 
 The `ReservationException` hierarchy extends `RuntimeException` because the
-`java.util.concurrent.locks.Lock` interface does not allow checked exceptions
-(only the SPI-level `LockingException` is checked):
+`java.util.concurrent.locks.Lock` interface does not allow checked exceptions:
 
 | Method | Throws | Reason |
 |--------|--------|--------|
@@ -1283,21 +775,20 @@ The `ReservationException` hierarchy extends `RuntimeException` because the
 | `unlock()` | `ReservationExpiredException` | Lease expired before unlock |
 | `newCondition()` | `UnsupportedOperationException` | Not supported |
 
-### 7.2 Recovery Scenarios
+### 6.2 Recovery Scenarios
 
-| Scenario | Hazelcast Behavior | Oracle Behavior |
-|----------|-------------------|-----------------|
-| Network partition | Lock may expire; other node may acquire | Same |
-| Client/Process crash | Hazelcast releases (member death) | Lock expires via TTL |
-| Lease expires during critical section | `ReservationExpiredException` on unlock | Same |
-| Backend unavailable | `ReservationAcquisitionException` | Same |
-| Database connection failure | N/A | `ReservationAcquisitionException` |
+| Scenario | Behavior |
+|----------|----------|
+| Network partition | Lock may expire; other node may acquire |
+| Client/Process crash | Hazelcast releases (member death) |
+| Lease expires during critical section | `ReservationExpiredException` on unlock |
+| Backend unavailable | `ReservationAcquisitionException` |
 
 ---
 
-## 8. Observability
+## 7. Observability
 
-### 8.1 Micrometer Metrics
+### 7.1 Micrometer Metrics
 
 | Metric Name | Type | Tags | Description |
 |-------------|------|------|-------------|
@@ -1307,13 +798,13 @@ The `ReservationException` hierarchy extends `RuntimeException` because the
 | `reservation.expired` | Counter | `domain`, `backend` | Reservations expired before unlock |
 | `reservation.active` | Gauge | `domain`, `backend` | Currently held reservations (approximate) |
 
-### 8.2 Metric Tags
+### 7.2 Metric Tags
 
 - `domain`: The reservation domain (for grouping/filtering)
-- `backend`: `hazelcast` or `oracle`
+- `backend`: `hazelcast`
 - `result`: `acquired`, `timeout`, `interrupted`, `error`
 
-### 8.3 Metrics Implementation
+### 7.3 Metrics Implementation
 
 ```java
 class ReservationMetrics {
@@ -1350,9 +841,9 @@ class ReservationMetrics {
 
 ---
 
-## 9. Testing Strategy
+## 8. Testing Strategy
 
-### 9.1 Test Pyramid
+### 8.1 Test Pyramid
 
 ```
                       ┌─────────────────┐
@@ -1362,19 +853,19 @@ class ReservationMetrics {
                                │
                       ┌────────▼────────┐
                       │  Integration    │  ← Testcontainers
-                      │  Tests          │     (Hazelcast + Oracle)
+                      │  Tests          │     (Hazelcast)
                       │  (Medium)       │
                       └────────┬────────┘
                                │
           ┌────────────────────▼────────────────────┐
           │              Unit Tests                  │  ← Embedded Hazelcast
-          │              (Many)                      │     + H2 (Oracle compat)
+          │              (Many)                      │
           └─────────────────────────────────────────┘
 ```
 
-### 9.2 Shared Test Suite with Abstract Base Class
+### 8.2 Shared Test Suite with Abstract Base Class
 
-Both implementations run the **same tests** via an abstract base class:
+All implementations run the **same tests** via an abstract base class:
 
 ```java
 package com.github.reservation;
@@ -1683,7 +1174,7 @@ abstract class AbstractReservationManagerTest {
 }
 ```
 
-### 9.3 Hazelcast Test Implementation
+### 8.3 Hazelcast Test Implementation
 
 ```java
 package com.github.reservation.hazelcast;
@@ -1732,71 +1223,7 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
 }
 ```
 
-### 9.4 Oracle Test Implementation
-
-```java
-package com.github.reservation.oracle;
-
-import com.github.reservation.*;
-import org.junit.jupiter.api.*;
-import javax.sql.DataSource;
-import com.zaxxer.hikari.*;
-import java.sql.*;
-import java.time.Duration;
-
-/**
- * Unit tests using H2 in-memory database.
- */
-class JdbcReservationManagerTest extends AbstractReservationManagerTest {
-
-    private static DataSource dataSource;
-    private static final String TABLE_NAME = "RESERVATION_LOCKS";
-
-    @BeforeAll
-    static void setupDatabase() throws SQLException {
-        HikariConfig config = new HikariConfig();
-        config.setJdbcUrl("jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1");
-        config.setMaximumPoolSize(5);
-        dataSource = new HikariDataSource(config);
-
-        // Create table
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("""
-                CREATE TABLE RESERVATION_LOCKS (
-                    reservation_key  VARCHAR(512)  NOT NULL,
-                    holder           VARCHAR(256)  NOT NULL,
-                    acquired_at      TIMESTAMP     NOT NULL,
-                    expires_at       TIMESTAMP     NOT NULL,
-                    PRIMARY KEY (reservation_key)
-                )
-                """);
-        }
-    }
-
-    @Override
-    protected ReservationManager createManager(String domain, Duration leaseTime) {
-        return ReservationManager.oracle(dataSource)
-            .domain(domain)
-            .leaseTime(leaseTime)
-            .tableName(TABLE_NAME)
-            .build();
-    }
-
-    @Override
-    protected void cleanup() {
-        // Clean table between tests
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("DELETE FROM " + TABLE_NAME);
-        } catch (SQLException e) {
-            // ignore
-        }
-    }
-}
-```
-
-### 9.5 Integration Tests with Testcontainers
+### 8.4 Integration Tests with Testcontainers
 
 For full integration testing with real Hazelcast cluster:
 
@@ -1835,44 +1262,26 @@ class HazelcastIntegrationTest extends AbstractReservationManagerTest {
 
 ---
 
-## 10. Performance Considerations
+## 9. Performance Considerations
 
-### 10.1 Operation Latencies
+### 9.1 Operation Latencies
 
-| Operation | Hazelcast | Oracle (Table-based) |
-|-----------|-----------|---------------------|
-| `lock()` (uncontended) | < 1ms | 5-20ms |
-| `tryLock()` (uncontended) | < 1ms | 5-20ms |
-| `unlock()` | < 1ms | 5-20ms |
-| `isLocked()` | < 1ms | 5-20ms |
-| Polling interval (contended) | N/A | 100ms - 2s (exponential) |
+| Operation | Hazelcast |
+|-----------|-----------|
+| `lock()` (uncontended) | < 1ms |
+| `tryLock()` (uncontended) | < 1ms |
+| `unlock()` | < 1ms |
+| `isLocked()` | < 1ms |
 
-### 10.2 Hazelcast Optimization
+### 9.2 Hazelcast Optimization
 
 1. **Client Proximity**: Deploy clients close to Hazelcast nodes
 2. **Lock Granularity**: Use fine-grained identifiers
 3. **Map Partitioning**: Diverse keys = better distribution
 
-### 10.3 Oracle Optimization
-
-1. **Connection Pool**: Properly sized (10-20 connections typical)
-2. **Index on expires_at**: For efficient cleanup queries
-3. **Polling Tuning**: Adjust `POLL_INTERVAL` and `MAX_POLL_INTERVAL` for your use case
-4. **Cleanup Strategy**: Consider periodic batch cleanup for expired locks
-
-### 10.4 Choosing Between Implementations
-
-| Use Case | Recommended |
-|----------|-------------|
-| Already using Hazelcast | Hazelcast |
-| Low latency required | Hazelcast |
-| Existing Oracle infrastructure, no Hazelcast | Oracle |
-| Strong ACID requirements | Oracle |
-| Audit trail needed | Oracle (table queryable) |
-
 ---
 
-## 11. Project Structure
+## 10. Project Structure
 
 ```
 reservation-lock/
@@ -1889,8 +1298,6 @@ reservation-lock/
 │   │                   ├── Reservation.java                    # Main interface
 │   │                   ├── ReservationManager.java             # Factory interface
 │   │                   ├── AbstractReservationManagerBuilder.java
-│   │                   ├── HazelcastReservationManagerBuilder.java
-│   │                   ├── OracleReservationManagerBuilder.java
 │   │                   ├── ReservationException.java           # Base exception
 │   │                   ├── ReservationAcquisitionException.java
 │   │                   ├── ReservationExpiredException.java
@@ -1898,56 +1305,38 @@ reservation-lock/
 │   │                   ├── hazelcast/
 │   │                   │   ├── HazelcastReservationManager.java
 │   │                   │   ├── HazelcastReservation.java
-│   │                   │   └── ReservationValueBuilder.java
-│   │                   ├── oracle/
-│   │                   │   ├── OracleReservationManager.java
-│   │                   │   ├── OracleReservation.java
-│   │                   │   ├── LockingStrategy.java            # Strategy interface
-│   │                   │   ├── LockingException.java
-│   │                   │   └── TableBasedLockingStrategy.java  # Default impl
+│   │                   │   └── HazelcastReservationManagerBuilder.java
 │   │                   └── internal/
-│   │                       ├── ReservationKeyBuilder.java
-│   │                       └── ReservationMetrics.java
+│   │                       ├── HoldTracker.java
+│   │                       ├── ReservationMetrics.java
+│   │                       ├── MicrometerReservationMetrics.java
+│   │                       └── NoOpReservationMetrics.java
 │   └── test/
 │       └── java/
 │           └── com/
 │               └── github/
 │                   └── reservation/
-│                       ├── AbstractReservationManagerTest.java  # Shared tests
-│                       ├── ReservationKeyBuilderTest.java
-│                       ├── hazelcast/
-│                       │   ├── HazelcastReservationManagerTest.java
-│                       │   └── HazelcastIntegrationTest.java
-│                       ├── oracle/
-│                       │   ├── OracleReservationManagerTest.java
-│                       │   └── TableBasedLockingStrategyTest.java
-│                       └── benchmark/
-│                           └── ReservationBenchmark.java
+│                       ├── AbstractReservationManagerTest.java  # Shared contract tests
+│                       ├── AbstractStressIntegrationTest.java   # Shared stress tests
+│                       └── hazelcast/
+│                           ├── HazelcastReservationManagerTest.java
+│                           ├── HazelcastClientReservationManagerTest.java
+│                           └── HazelcastStressIntegrationTest.java
 ```
 
 ---
 
-## 12. Dependencies
+## 11. Dependencies
 
-### 12.1 Runtime Dependencies
+### 11.1 Runtime Dependencies
 
 ```xml
 <dependencies>
-    <!-- Hazelcast Client (optional - for Hazelcast backend) -->
+    <!-- Hazelcast -->
     <dependency>
         <groupId>com.hazelcast</groupId>
         <artifactId>hazelcast</artifactId>
         <version>5.3.6</version>
-        <optional>true</optional>
-    </dependency>
-
-    <!-- Oracle JDBC (optional - for Oracle backend) -->
-    <dependency>
-        <groupId>com.oracle.database.jdbc</groupId>
-        <artifactId>ojdbc11</artifactId>
-        <version>23.3.0.23.09</version>
-        <optional>true</optional>
-        <scope>provided</scope>
     </dependency>
 
     <!-- Micrometer (optional - for metrics) -->
@@ -1960,7 +1349,7 @@ reservation-lock/
 </dependencies>
 ```
 
-### 12.2 Test Dependencies
+### 11.2 Test Dependencies
 
 ```xml
 <dependencies>
@@ -1993,20 +1382,6 @@ reservation-lock/
         <version>1.19.3</version>
         <scope>test</scope>
     </dependency>
-    <dependency>
-        <groupId>org.testcontainers</groupId>
-        <artifactId>oracle-xe</artifactId>
-        <version>1.19.3</version>
-        <scope>test</scope>
-    </dependency>
-
-    <!-- HikariCP for Oracle tests -->
-    <dependency>
-        <groupId>com.zaxxer</groupId>
-        <artifactId>HikariCP</artifactId>
-        <version>5.1.0</version>
-        <scope>test</scope>
-    </dependency>
 
     <!-- Awaitility -->
     <dependency>
@@ -2018,7 +1393,7 @@ reservation-lock/
 </dependencies>
 ```
 
-### 12.3 Build Configuration
+### 11.3 Build Configuration
 
 ```xml
 <properties>
@@ -2053,40 +1428,30 @@ reservation-lock/
 
 ---
 
-## 13. Roadmap
+## 12. Roadmap
 
 ### Phase 1: Core Implementation
 1. Project setup (Maven, dependencies, structure)
 2. Core interfaces (`Reservation`, `ReservationManager`)
 3. Exception hierarchy
-4. Key builder with validation
-5. `HazelcastReservationManager` implementation
-6. `HazelcastReservation` implementation
-7. Unit tests with embedded Hazelcast
+4. `HazelcastReservationManager` implementation
+5. `HazelcastReservation` implementation
+6. Unit tests with embedded Hazelcast
 
-### Phase 2: Oracle Implementation
-8. `LockingStrategy` interface
-9. `TableBasedLockingStrategy` implementation
-10. `OracleReservationManager` implementation
-11. `OracleReservation` implementation
-12. Unit tests with Testcontainers Oracle
+### Phase 2: Shared Testing & Quality
+7. Abstract base test class
+8. Integration tests with Testcontainers
+9. Concurrency stress tests
+10. Edge case handling
 
-### Phase 3: Shared Testing & Quality
-13. Abstract base test class
-14. Run same tests on both implementations
-15. Integration tests with Testcontainers
-16. Concurrency stress tests
-17. Edge case handling
+### Phase 3: Observability
+11. Micrometer metrics integration
+12. Metric documentation
 
-### Phase 4: Observability
-18. Micrometer metrics integration
-19. Metric documentation
-
-### Phase 5: Polish
-20. README with usage examples
-21. Javadoc documentation
-22. Performance benchmarks (JMH)
-23. Schema documentation for Oracle
+### Phase 4: Polish
+13. README with usage examples
+14. Javadoc documentation
+15. Performance benchmarks (JMH)
 
 ---
 
@@ -2104,26 +1469,6 @@ ReservationManager ordersManager = ReservationManager.hazelcast(hz)
     .build();
 
 // Get reservation by identifier only
-Reservation reservation = ordersManager.getReservation("order-12345");
-reservation.lock();
-try {
-    processOrder("order-12345");
-} finally {
-    reservation.unlock();
-}
-```
-
-### Basic Usage (Oracle)
-
-```java
-DataSource dataSource = getDataSource();
-
-// Create manager for the "orders" domain
-ReservationManager ordersManager = ReservationManager.oracle(dataSource)
-    .domain("orders")
-    .leaseTime(Duration.ofMinutes(2))
-    .build();
-
 Reservation reservation = ordersManager.getReservation("order-12345");
 reservation.lock();
 try {
@@ -2191,62 +1536,13 @@ try {
 }
 ```
 
-### Custom Locking Strategy (Oracle)
-
-```java
-// Implement custom strategy
-class MyCustomLockingStrategy implements LockingStrategy {
-    // ... custom implementation
-}
-
-// Use custom strategy
-ReservationManager manager = ReservationManager.oracle(dataSource)
-    .domain("orders")
-    .lockingStrategy(new MyCustomLockingStrategy())
-    .build();
-```
-
----
-
-## Appendix B: Oracle Schema Reference
-
-```sql
--- Required table (create before using library)
-CREATE TABLE RESERVATION_LOCKS (
-    reservation_key  VARCHAR2(512)  NOT NULL,
-    holder           VARCHAR2(256)  NOT NULL,
-    acquired_at      TIMESTAMP      NOT NULL,
-    expires_at       TIMESTAMP      NOT NULL,
-    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
-);
-
-CREATE INDEX idx_reservation_locks_expires ON RESERVATION_LOCKS (expires_at);
-
--- Optional: Grant to application user
-GRANT SELECT, INSERT, UPDATE, DELETE ON RESERVATION_LOCKS TO app_user;
-
--- Optional: Scheduled cleanup job
-BEGIN
-    DBMS_SCHEDULER.CREATE_JOB(
-        job_name        => 'CLEANUP_EXPIRED_RESERVATIONS',
-        job_type        => 'PLSQL_BLOCK',
-        job_action      => 'DELETE FROM RESERVATION_LOCKS WHERE expires_at < SYSTIMESTAMP;',
-        repeat_interval => 'FREQ=HOURLY',
-        enabled         => TRUE
-    );
-END;
-/
-```
-
----
-
-## Appendix C: Open Questions / Future Considerations
+## Appendix B: Open Questions / Future Considerations
 
 1. **Lock extension**: Should we support extending lease time while holding?
 2. **Lock callbacks**: Event hooks for acquisition/release/expiration?
 3. **Spring Integration**: Auto-configuration, `@Reserved` annotation?
 4. **Lock querying**: Ability to list all locks in a domain?
-5. **Alternative Oracle strategies**: DBMS_LOCK, SELECT FOR UPDATE, AQ?
+5. **Additional backends**: e.g. a JDBC/database-backed implementation via the existing abstractions?
 6. **Multi-datacenter**: Support for geo-distributed locking?
 
 ---

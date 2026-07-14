@@ -69,8 +69,8 @@ class HazelcastStressIntegrationTest extends AbstractStressIntegrationTest {
     }
 
     // ==================== Conservative parameters for Testcontainers ====================
-    // Hazelcast in Docker is slower than embedded H2 — reduce thread counts
-    // to avoid overwhelming the container on CI hardware.
+    // Hazelcast in Docker is slower than an embedded instance — reduce thread
+    // counts to avoid overwhelming the container on CI hardware.
 
     @Override
     protected int highThreadCount() { return 20; }

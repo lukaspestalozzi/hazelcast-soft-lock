@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Distributed soft-lock library implementing `java.util.concurrent.locks.Lock` with automatic lease expiration. Supports two backends: **Hazelcast** (using IMap.lock) and **Oracle/JDBC** (using table-based locking with polling).
+Distributed soft-lock library implementing `java.util.concurrent.locks.Lock` with automatic lease expiration. Backed by **Hazelcast** (using IMap.lock); the core abstractions are backend-agnostic so additional backends can be added later.
 
 ### Key Design: Single-Domain Managers
 
@@ -17,16 +17,13 @@ ReservationManager ordersManager = ReservationManager.hazelcast(hz)
 Reservation reservation = ordersManager.getReservation("order-12345");
 ```
 
-**Domain isolation:**
-- Hazelcast: Each domain uses a separate IMap (`{mapPrefix}-{domain}`, e.g., `reservations-orders`)
-- Oracle: Uses composite keys in format `{domain}::{identifier}`
+**Domain isolation:** Each domain uses a separate IMap (`{mapPrefix}-{domain}`, e.g., `reservations-orders`)
 
 ## Tech Stack
 
 - Java 21
 - Maven 3.x
-- Hazelcast 5.3.6 (optional dependency)
-- H2 for tests, Oracle for production JDBC backend
+- Hazelcast 5.3.6
 - JUnit 5, AssertJ, Testcontainers
 
 ## Project Structure
@@ -42,19 +39,13 @@ src/main/java/com/github/reservation/
 ├── InvalidReservationKeyException.java
 ├── internal/                     # Shared internals (not public API)
 │   ├── HoldTracker.java          # Per-thread hold state, shared per manager
-│   ├── ReservationKeyBuilder.java
-│   └── ReservationMetrics.java
-├── hazelcast/                    # Hazelcast backend
-│   ├── HazelcastReservation.java
-│   ├── HazelcastReservationManager.java
-│   └── HazelcastReservationManagerBuilder.java
-└── oracle/                       # JDBC/Oracle backend
-    ├── LockingStrategy.java      # Pluggable locking strategy interface (checked LockingException)
-    ├── LockingException.java
-    ├── TableBasedLockingStrategy.java
-    ├── OracleReservation.java
-    ├── OracleReservationManager.java
-    └── OracleReservationManagerBuilder.java
+│   ├── ReservationMetrics.java
+│   ├── MicrometerReservationMetrics.java
+│   └── NoOpReservationMetrics.java
+└── hazelcast/                    # Hazelcast backend
+    ├── HazelcastReservation.java
+    ├── HazelcastReservationManager.java
+    └── HazelcastReservationManagerBuilder.java
 ```
 
 For detailed architecture, see `docs/DESIGN.md`.
@@ -132,19 +123,18 @@ Use `scripts/run-maven-with-proxy.sh` to automatically start the proxy and run M
 
 ## Code Conventions
 
-- Exceptions: `ReservationException` hierarchy is unchecked (the `Lock` interface cannot declare checked exceptions); the JDBC SPI-level `LockingException` is checked
+- Exceptions: `ReservationException` hierarchy is unchecked (the `Lock` interface cannot declare checked exceptions)
 - Domain: Required on manager builder (throws `IllegalStateException` if not set)
-- Key format: Hazelcast uses identifier only (domain isolation via separate maps); Oracle uses `{domain}::{identifier}`
+- Key format: identifier only (domain isolation via separate maps)
 - Thread safety: Implementations must be thread-safe; ownership is tracked per thread via the per-manager `HoldTracker`, so reentrancy and unlock work across `Reservation` instances from the same manager
-- Reentrancy: Both backends support reentrant locking
+- Reentrancy: Reentrant locking must be supported
 
 ## Testing Notes
 
-- `AbstractReservationManagerTest` contains 20+ shared tests for both backends
+- `AbstractReservationManagerTest` contains 20+ shared contract tests that any backend implementation must pass
 - `createManager(String domain, Duration leaseTime)` - tests must specify domain
 - Domain isolation tests verify locks with same identifier in different domains are independent
 - Hazelcast tests use embedded instance (no external dependencies)
-- JDBC tests use H2 in-memory database
 - Integration tests (with Testcontainers) require `-Pintegration-tests` profile
 
 ## CI/CD

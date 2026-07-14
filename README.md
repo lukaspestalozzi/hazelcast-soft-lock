@@ -6,7 +6,7 @@ A distributed soft-lock library for Java implementing `java.util.concurrent.lock
 
 - **Implements `java.util.concurrent.locks.Lock`** - Familiar API for Java developers
 - **Automatic expiration** - Locks auto-release after configurable lease time (default: 1 minute)
-- **Two backends** - Hazelcast (IMap.lock) and Oracle DB (table-based with polling)
+- **Hazelcast backend** - Built on IMap.lock with lease support; the core abstractions allow additional backends in the future
 - **Reentrant locking** - Same thread can acquire the same lock multiple times
 - **Micrometer metrics** - Built-in observability support
 - **Domain isolation** - Each manager handles one domain (e.g., "orders", "users")
@@ -23,8 +23,6 @@ A distributed soft-lock library for Java implementing `java.util.concurrent.lock
 
 ## Quick Start
 
-### Hazelcast Backend
-
 ```java
 HazelcastInstance hz = HazelcastClient.newHazelcastClient();
 
@@ -39,26 +37,6 @@ Reservation reservation = ordersManager.getReservation("order-12345");
 reservation.lock();
 try {
     // Critical section - only one process can execute this
-    processOrder("order-12345");
-} finally {
-    reservation.unlock();
-}
-```
-
-### Oracle Backend
-
-```java
-DataSource dataSource = getDataSource(); // Your connection pool
-
-ReservationManager ordersManager = ReservationManager.oracle(dataSource)
-    .domain("orders")
-    .leaseTime(Duration.ofMinutes(2))
-    .tableName("RESERVATION_LOCKS")
-    .build();
-
-Reservation reservation = ordersManager.getReservation("order-12345");
-reservation.lock();
-try {
     processOrder("order-12345");
 } finally {
     reservation.unlock();
@@ -129,60 +107,6 @@ try {
 |--------|------|---------|-------------|
 | `mapPrefix` | `String` | `reservations` | Prefix for IMap name (actual name: `{prefix}-{domain}`) |
 
-### Oracle-Specific
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `tableName` | `String` | `RESERVATION_LOCKS` | Table name |
-| `lockingStrategy` | `LockingStrategy` | `TableBasedLockingStrategy` | Pluggable strategy |
-
-## Oracle Database Setup
-
-Create the required table before using the Oracle backend:
-
-```sql
-CREATE TABLE RESERVATION_LOCKS (
-    reservation_key  VARCHAR2(512)  NOT NULL,
-    holder           VARCHAR2(256)  NOT NULL,
-    acquired_at      TIMESTAMP      NOT NULL,
-    expires_at       TIMESTAMP      NOT NULL,
-    CONSTRAINT pk_reservation_locks PRIMARY KEY (reservation_key)
-);
-
--- Index for efficient cleanup of expired locks
-CREATE INDEX idx_reservation_locks_expires ON RESERVATION_LOCKS (expires_at);
-
--- Optional: Grant permissions
-GRANT SELECT, INSERT, UPDATE, DELETE ON RESERVATION_LOCKS TO app_user;
-```
-
-### For H2 (Testing)
-
-```sql
-CREATE TABLE RESERVATION_LOCKS (
-    reservation_key  VARCHAR(512)  NOT NULL,
-    holder           VARCHAR(256)  NOT NULL,
-    acquired_at      TIMESTAMP     NOT NULL,
-    expires_at       TIMESTAMP     NOT NULL,
-    PRIMARY KEY (reservation_key)
-);
-```
-
-### Scheduled Cleanup (Optional)
-
-```sql
-BEGIN
-    DBMS_SCHEDULER.CREATE_JOB(
-        job_name        => 'CLEANUP_EXPIRED_RESERVATIONS',
-        job_type        => 'PLSQL_BLOCK',
-        job_action      => 'DELETE FROM RESERVATION_LOCKS WHERE expires_at < SYSTIMESTAMP;',
-        repeat_interval => 'FREQ=HOURLY',
-        enabled         => TRUE
-    );
-END;
-/
-```
-
 ## Micrometer Metrics
 
 When a `MeterRegistry` is provided, the following metrics are recorded:
@@ -216,40 +140,12 @@ ReservationManager manager = ReservationManager.hazelcast(hz)
 | `IllegalMonitorStateException` | Unlock without holding lock | Programming error |
 | `UnsupportedOperationException` | `newCondition()` called | Not supported for distributed locks |
 
-## Custom Locking Strategy (Oracle)
+## Adding Another Backend
 
-Implement `LockingStrategy` for custom Oracle locking mechanisms:
-
-```java
-public class MyCustomStrategy implements LockingStrategy {
-    @Override
-    public boolean tryAcquire(String key, String holder, Duration leaseTime) {
-        // Custom implementation
-    }
-
-    @Override
-    public boolean release(String key, String holder) {
-        // Custom implementation
-    }
-
-    // ... other methods
-}
-
-ReservationManager manager = ReservationManager.oracle(dataSource)
-    .domain("orders")
-    .lockingStrategy(new MyCustomStrategy())
-    .build();
-```
-
-## Choosing Between Backends
-
-| Use Case | Recommended |
-|----------|-------------|
-| Already using Hazelcast | Hazelcast |
-| Low latency required (< 1ms) | Hazelcast |
-| Only Oracle infrastructure available | Oracle |
-| Need queryable audit trail | Oracle |
-| Strong ACID requirements | Oracle |
+The public API is backend-agnostic. To add a new backend, implement `Reservation` and
+`ReservationManager`, extend `AbstractReservationManagerBuilder` for its builder, and
+run the shared contract tests (`AbstractReservationManagerTest`,
+`AbstractStressIntegrationTest`) against the new implementation.
 
 ## Thread Safety
 
@@ -278,8 +174,7 @@ mvn clean package -DskipTests
 
 - Java 21+
 - Maven 3.x
-- Hazelcast 5.3.6 (for Hazelcast backend)
-- Oracle Database or H2 (for JDBC backend)
+- Hazelcast 5.3.6
 
 ## License
 

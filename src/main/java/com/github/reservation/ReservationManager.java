@@ -1,18 +1,16 @@
 package com.github.reservation;
 
 import com.github.reservation.hazelcast.HazelcastReservationManagerBuilder;
-import com.github.reservation.oracle.OracleReservationManagerBuilder;
 import com.hazelcast.core.HazelcastInstance;
 
-import javax.sql.DataSource;
 import java.io.Closeable;
 import java.time.Duration;
 
 /**
  * Factory and manager for {@link Reservation} instances within a single domain.
  *
- * <p>A ReservationManager is bound to a specific backend (Hazelcast or Oracle), a single
- * domain, and configuration. Each manager handles reservations for one domain only.
+ * <p>A ReservationManager is bound to a specific backend, a single domain, and
+ * configuration. Each manager handles reservations for one domain only.
  * For multiple domains, create multiple managers.</p>
  *
  * <p>Example usage with Hazelcast:</p>
@@ -31,15 +29,6 @@ import java.time.Duration;
  *     reservation.unlock();
  * }
  * }</pre>
- *
- * <p>Example usage with Oracle:</p>
- * <pre>{@code
- * DataSource dataSource = ...;
- * ReservationManager manager = ReservationManager.oracle(dataSource)
- *     .domain("orders")
- *     .leaseTime(Duration.ofMinutes(1))
- *     .build();
- * }</pre>
  */
 public interface ReservationManager extends Closeable {
 
@@ -52,17 +41,6 @@ public interface ReservationManager extends Closeable {
      */
     static HazelcastReservationManagerBuilder hazelcast(HazelcastInstance hazelcastInstance) {
         return new HazelcastReservationManagerBuilder(hazelcastInstance);
-    }
-
-    /**
-     * Creates a new builder for an Oracle-backed ReservationManager.
-     *
-     * @param dataSource the DataSource to use for database connections
-     * @return a new builder instance
-     * @throws NullPointerException if dataSource is null
-     */
-    static OracleReservationManagerBuilder oracle(DataSource dataSource) {
-        return new OracleReservationManagerBuilder(dataSource);
     }
 
     /**
@@ -94,7 +72,7 @@ public interface ReservationManager extends Closeable {
     /**
      * Closes this manager and releases associated resources.
      *
-     * <p>Note: This does NOT close the underlying Hazelcast instance or DataSource,
+     * <p>Note: This does NOT close the underlying Hazelcast instance,
      * nor does it release any currently held reservations.</p>
      */
     @Override
