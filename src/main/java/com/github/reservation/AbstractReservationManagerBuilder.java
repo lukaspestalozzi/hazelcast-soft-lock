@@ -1,5 +1,7 @@
 package com.github.reservation;
 
+import io.micrometer.core.instrument.MeterRegistry;
+
 import java.time.Duration;
 import java.util.Objects;
 
@@ -12,8 +14,7 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
 
     protected String domain;
     protected Duration leaseTime = Duration.ofMinutes(1);
-    /** Stored as Object to avoid a hard dependency on Micrometer at class-load time. */
-    protected Object meterRegistry = null;
+    protected MeterRegistry meterRegistry = null;
 
     /**
      * Sets the domain for this ReservationManager. This is required.
@@ -56,14 +57,14 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
     /**
      * Sets the Micrometer registry for metrics. Default: none (metrics disabled).
      *
-     * <p>Pass a {@code io.micrometer.core.instrument.MeterRegistry} instance.
-     * If Micrometer is not on the classpath, this setting is silently ignored.</p>
+     * <p>Micrometer is an optional dependency; calling this method requires
+     * {@code micrometer-core} on the classpath.</p>
      *
      * @param meterRegistry the meter registry, or null to disable metrics
      * @return this builder
      */
     @SuppressWarnings("unchecked")
-    public T meterRegistry(Object meterRegistry) {
+    public T meterRegistry(MeterRegistry meterRegistry) {
         this.meterRegistry = meterRegistry;
         return (T) this;
     }

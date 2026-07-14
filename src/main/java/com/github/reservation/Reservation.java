@@ -28,13 +28,6 @@ public interface Reservation extends Lock {
     String getIdentifier();
 
     /**
-     * Returns the composite key used for this reservation.
-     *
-     * @return the composite key string, never null
-     */
-    String getReservationKey();
-
-    /**
      * Returns the remaining lease time for this reservation.
      *
      * @return remaining lease time, or {@link Duration#ZERO} if not held
