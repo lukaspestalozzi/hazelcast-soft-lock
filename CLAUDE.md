@@ -22,8 +22,8 @@ Reservation reservation = ordersManager.getReservation("order-12345");
 ## Tech Stack
 
 - Java 21
-- Maven 3.x
-- Hazelcast 5.3.6
+- Maven 3.6.3+
+- Hazelcast 5.4.x (pinned: 5.5+ is no longer Apache-2.0 licensed)
 - JUnit 5, AssertJ, Testcontainers
 
 ## Project Structure
@@ -36,10 +36,12 @@ src/main/java/com/github/reservation/
 ├── ReservationException.java     # Base of the (unchecked) exception hierarchy
 ├── ReservationAcquisitionException.java
 ├── ReservationExpiredException.java
+├── ReservationReleaseException.java
 ├── InvalidReservationKeyException.java
 ├── internal/                     # Shared internals (not public API)
 │   ├── HoldTracker.java          # Per-thread hold state, shared per manager
 │   ├── ReservationMetrics.java
+│   ├── GuardedReservationMetrics.java
 │   ├── MicrometerReservationMetrics.java
 │   └── NoOpReservationMetrics.java
 └── hazelcast/                    # Hazelcast backend

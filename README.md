@@ -11,6 +11,27 @@ A distributed soft-lock library for Java implementing `java.util.concurrent.lock
 - **Micrometer metrics** - Built-in observability support
 - **Domain isolation** - Each manager handles one domain (e.g., "orders", "users")
 
+## Guarantees & Limitations
+
+This is a **soft lock**: an advisory, best-effort mutual exclusion primitive with a
+safety net (the lease) against crashed or stuck holders. Understand its limits before
+guarding anything critical with it:
+
+- **Lease expiry can end your exclusivity mid-operation.** If the critical section
+  outlives the lease, another process can acquire the reservation while you are still
+  working. You find out at `unlock()` time via `ReservationExpiredException` — not at
+  the moment exclusivity was lost.
+- **Network partitions (split-brain) can violate mutual exclusion.** The Hazelcast
+  backend uses `IMap` locks, which are partition-based (AP) rather than consensus-based:
+  during a partition, both sides of the split can grant the same reservation. Hazelcast
+  recommends its CP Subsystem (`FencedLock`) for correctness-critical locking, but
+  `FencedLock` has no lease-time auto-expiry, which is this library's core feature.
+- **Consequence:** do not use reservations as the sole guard for non-idempotent,
+  unfenced side effects (payments, emails, ...). Suitable uses are work deduplication,
+  best-effort serialization, and efficiency locks — anywhere a rare double-execution is
+  tolerable or the protected operation is idempotent/fenced (e.g. via a version check
+  in the datastore).
+
 ## Installation
 
 ```xml
@@ -106,17 +127,21 @@ try {
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `mapPrefix` | `String` | `reservations` | Prefix for IMap name (actual name: `{prefix}-{domain}`) |
+| `debugValues` | `boolean` | `true` | Store `holder={thread}@{host},acquired={instant}` in the map entry while held (one extra best-effort map operation per acquisition and final unlock; disable for very hot locks) |
 
 ## Micrometer Metrics
 
-When a `MeterRegistry` is provided, the following metrics are recorded:
+When a `MeterRegistry` is provided, the following metrics are recorded (attempt counts
+can be derived from the timer's per-`result` counts):
 
 | Metric | Type | Tags | Description |
 |--------|------|------|-------------|
-| `reservation.acquire` | Timer | domain, backend, result | Acquisition time |
-| `reservation.acquire.attempts` | Counter | domain, backend, result | Acquisition attempts |
+| `reservation.acquire` | Timer | domain, backend, result | Acquisition time and outcome (`acquired`, `unavailable`, `timeout`, `interrupted`, `error`) |
 | `reservation.held.time` | Timer | domain, backend | Duration held |
-| `reservation.expired` | Counter | domain, backend | Expirations before unlock |
+| `reservation.expired` | Counter | domain, backend | Ownership lost before unlock (lease expiry or force-release) |
+
+Metrics recording is exception-safe: a misbehaving registry is logged and ignored,
+never allowed to affect lock correctness.
 
 ### Example with Prometheus
 
@@ -134,8 +159,9 @@ ReservationManager manager = ReservationManager.hazelcast(hz)
 | Exception | When Thrown | Handling |
 |-----------|-------------|----------|
 | `ReservationAcquisitionException` | Lock cannot be acquired (infrastructure issue) | Retry or fail operation |
-| `ReservationExpiredException` | Lease expired before unlock | Log warning, handle inconsistency |
-| `InvalidReservationKeyException` | Invalid identifier | Fix key validation |
+| `ReservationExpiredException` | Ownership already lost at unlock (lease expiry, or a force-release) | Log warning, handle inconsistency |
+| `ReservationReleaseException` | Unlock failed for infrastructure reasons (outcome unknown, hold kept) | Retry unlock; lease expiry is the backstop |
+| `InvalidReservationKeyException` | Invalid identifier (extends `IllegalArgumentException`, not `ReservationException`) | Fix key validation |
 | `IllegalStateException` | Building without required domain | Set domain on builder |
 | `IllegalMonitorStateException` | Unlock without holding lock | Programming error |
 | `UnsupportedOperationException` | `newCondition()` called | Not supported for distributed locks |
@@ -173,8 +199,9 @@ mvn clean package -DskipTests
 ## Requirements
 
 - Java 21+
-- Maven 3.x
-- Hazelcast 5.3.6
+- Maven 3.6.3+
+- Hazelcast 5.4.x (deliberately not 5.5+: Hazelcast dropped the Apache-2.0 open source
+  edition as of 5.5, which conflicts with this library's licensing)
 
 ## License
 

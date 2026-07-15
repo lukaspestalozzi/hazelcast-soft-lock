@@ -59,8 +59,13 @@ The library ships a single backend implementation, **Hazelcast**, using `IMap.lo
 | Error handling | Dedicated unchecked exception hierarchy | `Lock` methods cannot declare checked exceptions |
 | Project structure | Single module | Simpler build, single artifact |
 | Testing | Abstract base test class | Shared contract tests for all implementations |
-| Hazelcast value | String with debug info | Debuggability with low overhead |
-| Micrometer coupling | Optional dependency, typed builder method | Standard optional-dependency pattern; no reflection |
+| Hazelcast value | String with debug info | Debuggability with low overhead; opt-out via `debugValues(false)` for hot locks |
+| Micrometer coupling | Optional dependency, typed builder method | Standard optional-dependency pattern; no reflection; pinned by a filtered-classloader test |
+| Metrics safety | Guarding decorator, meters cached | A throwing registry must never corrupt lock state; fixed tag space needs no per-op meter lookup |
+| Stale-hold detection | Local clock with safety margin | Mis-detection must fail loud (leaked hold until lease expiry), never silent (released while believed held) — see §4.4 |
+| Unlock failure | `ReservationExpiredException` vs `ReservationReleaseException` | Distinguish "ownership lost" from "outcome unknown, retryable" |
+| Consistency model | Hazelcast IMap locks (AP) | Lease support is the core feature; CP `FencedLock` has no lease — accepted split-brain caveat, see §4.6 |
+| Hazelcast version | 5.4.x line | 5.5+ dropped the Apache-2.0 open source edition, conflicting with this library's license |
 
 ---
 
@@ -156,10 +161,10 @@ Additional backends can be added by implementing `Reservation` and `ReservationM
 
 The public API lives in `com.github.reservation` (see the source javadoc for full contracts):
 
-- **`Reservation extends Lock`** (`Reservation.java`) — adds `getIdentifier()`, `getRemainingLeaseTime()`, `isLocked()`, and the administrative `forceUnlock()`. `newCondition()` throws `UnsupportedOperationException`. `unlock()` after lease expiry throws `ReservationExpiredException`; unlocking without holding throws `IllegalMonitorStateException`.
-- **`ReservationManager extends Closeable`** (`ReservationManager.java`) — the factory bound to one backend + one domain. Static entry point: `ReservationManager.hazelcast(hazelcastInstance)` returns the Hazelcast builder. `getReservation(identifier)` returns a new instance each call, but the underlying distributed lock (and per-thread hold state) is shared for the same identifier. `close()` releases manager resources only — never the injected Hazelcast instance or held locks.
-- **Exception hierarchy** — `ReservationException extends RuntimeException` (the `Lock` interface cannot declare checked exceptions), with `ReservationAcquisitionException` (infrastructure failure during acquire) and `ReservationExpiredException` (lease lapsed before unlock; carries domain + identifier). `InvalidReservationKeyException extends IllegalArgumentException` rejects null/empty identifiers.
-- **Builders** — `AbstractReservationManagerBuilder` holds shared configuration: `domain(String)` (required), `leaseTime(Duration)` (default 1 minute, must be positive), `meterRegistry(MeterRegistry)` (optional; requires Micrometer on the classpath when called). `HazelcastReservationManagerBuilder` adds `mapPrefix(String)`. `build()` throws `IllegalStateException` if domain is unset.
+- **`Reservation extends Lock`** (`Reservation.java`) — adds `getIdentifier()`, `getRemainingLeaseTime()` (a per-thread, local estimate), `isLocked()` (held by *anyone*), `isHeldByCurrentThread()` (held by *me*, with a conservative safety margin near lease end), and the administrative `forceUnlock()`. `newCondition()` throws `UnsupportedOperationException`. `unlock()` after ownership loss throws `ReservationExpiredException`; unlock failing on infrastructure throws `ReservationReleaseException` (hold kept, retryable); unlocking without holding throws `IllegalMonitorStateException`.
+- **`ReservationManager extends Closeable`** (`ReservationManager.java`) — the factory bound to one backend + one domain. Static entry point: `ReservationManager.hazelcast(hazelcastInstance)` returns the Hazelcast builder. This couples the core interface to the Hazelcast types at compile time — a deliberate convenience while there is a single backend; if a second backend lands and consumers need Hazelcast-free classpaths, discovery moves to the builders. `getReservation(identifier)` returns a new instance each call, but the underlying distributed lock (and per-thread hold state) is shared for the same identifier. `close()` releases manager resources only — never the injected Hazelcast instance or held locks.
+- **Exception hierarchy** — `ReservationException extends RuntimeException` (the `Lock` interface cannot declare checked exceptions), with `ReservationAcquisitionException` (infrastructure failure during acquire), `ReservationExpiredException` (ownership lost before unlock — usually lease expiry, but a force-release or cluster event is indistinguishable; carries domain + identifier), and `ReservationReleaseException` (unlock failed for infrastructure reasons; the outcome is unknown and the local hold is kept so unlock can be retried — lease expiry is the backstop). `InvalidReservationKeyException` deliberately extends `IllegalArgumentException` instead: an invalid identifier is a caller programming error, not a reservation runtime condition (so `catch (ReservationException)` does not catch it).
+- **Builders** — `AbstractReservationManagerBuilder` holds shared configuration: `domain(String)` (required), `leaseTime(Duration)` (default 1 minute, must be positive and expressible in milliseconds), `meterRegistry(MeterRegistry)` (optional; requires Micrometer on the classpath when called). `HazelcastReservationManagerBuilder` adds `mapPrefix(String)` and `debugValues(boolean)`. `build()` throws `IllegalStateException` if domain is unset.
 
 Adding a backend means: implement `Reservation` + `ReservationManager`, extend the abstract builder, expose a static factory on `ReservationManager`, reuse `HoldTracker`/`ReservationMetrics` from `internal/`, and pass the shared test suites (§8).
 
@@ -175,24 +180,37 @@ Adding a backend means: implement `Reservation` + `ReservationManager`, extend t
 
 For operational debuggability, a value of the form `holder={thread}@{host},acquired={instant}` is stored in the map entry (with TTL = lease time) after each acquisition, and removed on final unlock. All debug-value writes/removals are **best-effort**: a failure must never turn a successful acquisition into an apparent failure (which would leak the lock until lease expiry) or block unlock. Removal uses `tryRemove` with zero timeout so an expired holder never blocks on the entry lock of a new holder.
 
+The debug value costs one extra map operation per acquisition and per final unlock; `debugValues(false)` on the builder disables it for hot locks.
+
 ### 4.3 Interrupt Handling (deliberate, not incidental)
 
 Hazelcast's locking API forces two workarounds that must be preserved:
 
 - `IMap.lock()` is not interruptible, but `Lock.lock()` must keep waiting through interrupts. `lock()` therefore retries in a loop, records that an interrupt happened, clears the flag before retrying (a set flag would make the next attempt fail immediately and spin), and re-asserts it before returning.
-- The **client-side** proxy surfaces interrupts as `HazelcastException(InterruptedException)` instead of throwing `InterruptedException` like the member-side proxy. All acquisition paths therefore walk the cause chain (`causedByInterrupt`) and translate. `lockInterruptibly()` polls `tryLock` in 100 ms slices, checking the interrupt flag between attempts.
+- The **client-side** proxy surfaces interrupts as `HazelcastException(InterruptedException)` instead of throwing `InterruptedException` like the member-side proxy. All acquisition paths therefore walk the cause chain (`causedByInterrupt`) and translate. `lockInterruptibly()` polls `tryLock` in slices, checking the interrupt flag between attempts; the slice starts at 100 ms (fast interrupt response) and backs off exponentially to a 1 s cap, limiting per-waiter network chatter on the client topology during long waits.
 
 ### 4.4 Reentrancy and Hold Tracking
 
 Hazelcast locks are reentrant per thread, but hold state must also work across different `Reservation` instances from the same manager. The per-manager `HoldTracker` keeps a thread-local map `identifier → Hold{count, acquiredAt}`:
 
-- `unlock()` consults the tracker to distinguish "never held" (`IllegalMonitorStateException`) from "lease expired" (`ReservationExpiredException`, thrown when the cluster no longer recognizes the hold we tracked).
+- `unlock()` consults the tracker to distinguish "never held" (`IllegalMonitorStateException`) from "ownership lost" (`ReservationExpiredException`, thrown when the cluster no longer recognizes the hold we tracked).
 - On re-acquisition after a lapsed lease, the stale count is reset — carrying it forward would let later unlocks release more than was acquired.
-- `getRemainingLeaseTime()` derives from the tracked `acquiredAt` and the configured lease.
+- **Safety margin (load-bearing):** whether the previous lease lapsed is judged by the local clock, but the cluster measures the lease from an earlier instant (the server granted the lock before its response arrived), so the two clocks can never agree exactly. The comparison is therefore biased by a margin (`min(500 ms, lease/5)`) toward *over*-detecting expiry. Rationale: over-detection merely leaks one reentrant server-side hold until lease expiry (loud, self-healing); under-detection would let a single `unlock()` release a freshly granted lock while the caller still believes it holds another count — silent loss of mutual exclusion. The contract test `reacquireNearLeaseEndMustNeverSilentlyReleaseTheLock` pins this failure-mode choice.
+- `getRemainingLeaseTime()` derives from the tracked `acquiredAt` and the configured lease — a local estimate, not a cluster query.
+- **Lifecycle:** the per-thread map is created lazily on first hold and dropped as soon as it empties, so pooled threads retain no empty state. A hold whose lease expired without unlock stays until the same thread touches the same identifier again (bounded; unreachable from the manager by design). Cross-thread operations (`forceUnlock`) cannot clean other threads' local state — it goes stale and surfaces on their next `unlock()`.
 
 ### 4.5 Thread Safety
 
 `HazelcastReservationManager` is immutable after construction. `HazelcastReservation` is thread-safe via Hazelcast's guarantees plus the thread-local hold state; ownership is strictly per-thread.
+
+### 4.6 Guarantees and Limitations (read this)
+
+This is a **soft lock** — advisory, best-effort mutual exclusion with lease expiry as the safety net. Two scenarios can end exclusivity without the holder noticing immediately:
+
+1. **Lease expiry mid-critical-section.** Detected lazily, at `unlock()` time, as `ReservationExpiredException`.
+2. **Split-brain.** `IMap` locks are partition-based (AP), not consensus-based: during a network partition, *both* sides can grant the same reservation simultaneously, and no exception ever surfaces this. Hazelcast's CP Subsystem (`FencedLock`) closes this gap but offers no lease-time auto-expiry, which is this library's core feature — the AP trade-off is accepted deliberately. The stress suite's mutual-exclusion proofs run against a healthy cluster and cannot detect partition behavior.
+
+Consequently: reservations must not be the sole guard for non-idempotent, unfenced side effects. Suitable uses are deduplication, best-effort serialization, and efficiency locks — anywhere the protected operation is idempotent, fenced (e.g. datastore version check), or a rare double-execution is tolerable.
 
 ---
 
@@ -229,17 +247,19 @@ The `ReservationException` hierarchy extends `RuntimeException` because the
 | `lockInterruptibly()` | `InterruptedException`, `ReservationAcquisitionException` | Interruption, infrastructure issues |
 | `tryLock()` | `ReservationAcquisitionException` | Held by another = false; backend error = exception; interrupt = false with flag restored |
 | `tryLock(time, unit)` | `InterruptedException`, `ReservationAcquisitionException` | Timeout = false; interruption or backend error = exception |
-| `unlock()` | `ReservationExpiredException`, `IllegalMonitorStateException` | Lease expired / not held |
+| `unlock()` | `ReservationExpiredException`, `ReservationReleaseException`, `IllegalMonitorStateException` | Ownership lost / infra failure (retryable, hold kept) / not held |
 | `newCondition()` | `UnsupportedOperationException` | Not supported |
 
 ### 6.2 Recovery Scenarios
 
 | Scenario | Behavior |
 |----------|----------|
-| Network partition | Lock may expire; other node may acquire |
+| Network partition | **Mutual exclusion may be violated**: both sides can grant the same reservation (see §4.6); after healing, the losing holder surfaces as `ReservationExpiredException` on unlock at best |
 | Client/Process crash | Hazelcast releases (member death) |
 | Lease expires during critical section | `ReservationExpiredException` on unlock |
-| Backend unavailable | `ReservationAcquisitionException` |
+| Backend unavailable during acquire | `ReservationAcquisitionException` |
+| Backend unavailable during unlock | `ReservationReleaseException`; hold kept, unlock retryable, lease expiry as backstop |
+| Force-release by an admin | Holder's next unlock throws `ReservationExpiredException` (indistinguishable from expiry) |
 
 ---
 
@@ -247,20 +267,21 @@ The `ReservationException` hierarchy extends `RuntimeException` because the
 
 ### 7.1 Micrometer Metrics
 
-Recorded when a `MeterRegistry` is configured on the builder (see `internal/MicrometerReservationMetrics.java`); otherwise a no-op implementation is used. Each metrics instance is scoped to one manager, so `backend` and `domain` tags are fixed at creation.
+Recorded when a `MeterRegistry` is configured on the builder (see `internal/MicrometerReservationMetrics.java`); otherwise a no-op implementation is used. Each metrics instance is scoped to one manager, so `backend` and `domain` tags are fixed at creation; meters are created once and cached (the tag space is tiny and fixed).
+
+Metrics run **after** lock state has already changed, so the Micrometer implementation is wrapped in a guarding decorator (`GuardedReservationMetrics`): a throwing registry is logged and ignored — it must never make a successful acquisition look failed (which would leak the lock until lease expiry) or abort unlock bookkeeping.
 
 | Metric Name | Type | Tags | Description |
 |-------------|------|------|-------------|
-| `reservation.acquire` | Timer | `domain`, `backend`, `result` | Acquisition time and outcome |
-| `reservation.acquire.attempts` | Counter | `domain`, `backend`, `result` | Acquisition attempts |
+| `reservation.acquire` | Timer | `domain`, `backend`, `result` | Acquisition time and outcome (attempt counts are derivable from per-result counts) |
 | `reservation.held.time` | Timer | `domain`, `backend` | Duration reservation was held |
-| `reservation.expired` | Counter | `domain`, `backend` | Reservations expired before unlock |
+| `reservation.expired` | Counter | `domain`, `backend` | Ownership lost before unlock (lease expiry or force-release) |
 
 ### 7.2 Metric Tags
 
 - `domain`: The reservation domain (for grouping/filtering)
 - `backend`: `hazelcast`
-- `result`: `acquired`, `timeout`, `unavailable`, `interrupted`, `error` (timer); `success`/`failure` (counter)
+- `result`: `acquired`, `timeout`, `unavailable`, `interrupted`, `error`
 
 ---
 
@@ -295,9 +316,11 @@ All implementations run the same tests via abstract base classes; a backend pass
 
 ### 8.3 Concrete Suites
 
-- `HazelcastReservationManagerTest` — contract tests against an embedded member; plus Hazelcast-specific tests (map naming, debug value, domain isolation, builder validation, metrics recording).
+- `HazelcastReservationManagerTest` — contract tests against an embedded member; plus Hazelcast-specific tests (map naming, debug value + opt-out, domain isolation, builder validation, metrics recording, backend-error mapping for acquire and release).
 - `HazelcastClientReservationManagerTest` — the same contract via a Hazelcast **client** connected to an embedded member: client proxies behave differently in places (e.g. interrupt wrapping, §4.3), so the contract must hold for both topologies.
-- `HazelcastStressIntegrationTest` — stress suite against a real Hazelcast container (Testcontainers); runs only with `-Pintegration-tests`.
+- `HazelcastMultiMemberReservationTest` — lock visibility and domain isolation across two clustered embedded members (a single-member suite cannot detect member-local locking bugs).
+- `MicrometerOptionalityTest` — runs a full lock/unlock scenario inside a classloader that refuses to load `io.micrometer.*`, pinning the optional-dependency claim (§1.3).
+- `HazelcastStressIntegrationTest` — stress suite against a real Hazelcast container (Testcontainers); runs only with `-Pintegration-tests` (in CI: on pull requests and default-branch pushes).
 
 ---
 
@@ -326,6 +349,7 @@ reservation-lock/
     │   ├── ReservationException.java           # Base (unchecked)
     │   ├── ReservationAcquisitionException.java
     │   ├── ReservationExpiredException.java
+    │   ├── ReservationReleaseException.java
     │   ├── InvalidReservationKeyException.java
     │   ├── hazelcast/
     │   │   ├── HazelcastReservationManager.java
@@ -334,14 +358,18 @@ reservation-lock/
     │   └── internal/                           # Not public API
     │       ├── HoldTracker.java
     │       ├── ReservationMetrics.java
+    │       ├── GuardedReservationMetrics.java
     │       ├── MicrometerReservationMetrics.java
     │       └── NoOpReservationMetrics.java
     └── test/java/com/github/reservation/
         ├── AbstractReservationManagerTest.java  # Shared contract tests
         ├── AbstractStressIntegrationTest.java   # Shared stress tests
+        ├── MicrometerOptionalityTest.java       # Micrometer-free classpath proof
+        ├── MicrometerFreeScenario.java
         └── hazelcast/
             ├── HazelcastReservationManagerTest.java
             ├── HazelcastClientReservationManagerTest.java
+            ├── HazelcastMultiMemberReservationTest.java
             └── HazelcastStressIntegrationTest.java
 ```
 
@@ -351,15 +379,15 @@ reservation-lock/
 
 Declared in `pom.xml` (authoritative). Summary:
 
-- **Runtime**: `com.hazelcast:hazelcast` (required), `io.micrometer:micrometer-core` (optional — only needed when `meterRegistry(...)` is used), `org.slf4j:slf4j-api`.
+- **Runtime**: `com.hazelcast:hazelcast` (required; pinned to the 5.4.x line — 5.5+ is no longer Apache-2.0 licensed), `io.micrometer:micrometer-core` (optional — only needed when `meterRegistry(...)` is used; verified by `MicrometerOptionalityTest`), `org.slf4j:slf4j-api`.
 - **Test**: JUnit 5, AssertJ, Awaitility, Testcontainers (core + junit-jupiter), Logback.
-- **Build**: Java 21 (`maven.compiler.release`), Surefire for `*Test`, Failsafe for `*IntegrationTest` behind the `integration-tests` profile; both with fork-timeout safety nets so a hung test JVM fails the build instead of stalling it.
+- **Build**: Java 21 (`maven.compiler.release`), Enforcer (Java 21+, Maven 3.6.3+), Surefire for `*Test`, Failsafe for `*IntegrationTest` behind the `integration-tests` profile; both with fork-timeout safety nets so a hung test JVM fails the build instead of stalling it.
 
 ---
 
 ## 12. Open Questions / Future Considerations
 
-1. **Lock extension**: Should we support extending lease time while holding?
+1. **Lock extension**: Should we support extending lease time while holding? (Related: `isHeldByCurrentThread()` now exists for callers to check before attempting.)
 2. **Lock callbacks**: Event hooks for acquisition/release/expiration?
 3. **Spring Integration**: Auto-configuration, `@Reserved` annotation?
 4. **Lock querying**: Ability to list all locks in a domain?
