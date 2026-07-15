@@ -3,6 +3,7 @@ package com.github.reservation.hazelcast;
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationAcquisitionException;
 import com.github.reservation.ReservationExpiredException;
+import com.github.reservation.ReservationReleaseException;
 import com.github.reservation.internal.HoldTracker;
 import com.github.reservation.internal.ReservationMetrics;
 import com.hazelcast.map.IMap;
@@ -23,8 +24,20 @@ final class HazelcastReservation implements Reservation {
     private static final Logger log = LoggerFactory.getLogger(HazelcastReservation.class);
 
     // IMap.lock() is not interruptible, so lockInterruptibly() polls with tryLock in
-    // slices of this length and checks the interrupt flag between attempts.
-    private static final long INTERRUPT_POLL_MILLIS = 100;
+    // slices and checks the interrupt flag between attempts. The slice starts short so
+    // interrupts are noticed quickly and backs off to a cap, limiting per-waiter network
+    // chatter on the client topology where every slice is a remote call.
+    private static final long INTERRUPT_POLL_INITIAL_MILLIS = 100;
+    private static final long INTERRUPT_POLL_MAX_MILLIS = 1_000;
+
+    // The stale-hold heuristic compares the local clock against a lease the cluster
+    // measures from an earlier instant (the server granted the lock before its response
+    // reached us), so the two can never agree exactly. The margin biases the comparison
+    // toward over-detecting expiry: mis-detection then leaks a reentrant hold until the
+    // lease expires (loud, self-healing) instead of silently releasing a lock the caller
+    // still believes it holds. The margin must stay well below the lease itself or every
+    // reentrant acquisition would look stale.
+    private static final Duration STALE_HOLD_MAX_MARGIN = Duration.ofMillis(500);
 
     // Resolved once; a DNS lookup per lock operation is needless overhead
     private static final String HOST_NAME = resolveHostName();
@@ -33,6 +46,8 @@ final class HazelcastReservation implements Reservation {
     private final String domain;
     private final String identifier;
     private final Duration leaseTime;
+    private final Duration staleHoldMargin;
+    private final boolean debugValues;
     private final ReservationMetrics metrics;
     private final HoldTracker holdTracker;
 
@@ -41,12 +56,15 @@ final class HazelcastReservation implements Reservation {
             String domain,
             String identifier,
             Duration leaseTime,
+            boolean debugValues,
             ReservationMetrics metrics,
             HoldTracker holdTracker) {
         this.lockMap = lockMap;
         this.domain = domain;
         this.identifier = identifier;
         this.leaseTime = leaseTime;
+        this.staleHoldMargin = min(STALE_HOLD_MAX_MARGIN, leaseTime.dividedBy(5));
+        this.debugValues = debugValues;
         this.metrics = metrics;
         this.holdTracker = holdTracker;
     }
@@ -73,17 +91,19 @@ final class HazelcastReservation implements Reservation {
     }
 
     @Override
+    public boolean isHeldByCurrentThread() {
+        HoldTracker.Hold hold = holdTracker.get(identifier);
+        return hold != null && hold.getCount() > 0 && !leaseLapsed(hold);
+    }
+
+    @Override
     public void forceUnlock() {
         log.warn("Force unlocking reservation: {}", identifier);
         lockMap.forceUnlock(identifier);
-        try {
-            // Best-effort cleanup of the debug value; zero timeout so we never block on a
-            // holder that acquired the lock right after the force unlock.
-            lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
-        } catch (Exception e) {
-            log.debug("Failed to remove debug value during forceUnlock for {}: {}",
-                identifier, e.getMessage());
-        }
+        removeDebugValue("forceUnlock");
+        // Only the calling thread's local hold state can be cleared here; holds tracked
+        // by other threads (in this or another process) go stale and surface as
+        // ReservationExpiredException on their next unlock.
         holdTracker.remove(identifier);
     }
 
@@ -132,12 +152,14 @@ final class HazelcastReservation implements Reservation {
         }
 
         Instant start = Instant.now();
+        long pollMillis = INTERRUPT_POLL_INITIAL_MILLIS;
         try {
-            while (!lockMap.tryLock(identifier, INTERRUPT_POLL_MILLIS, TimeUnit.MILLISECONDS,
+            while (!lockMap.tryLock(identifier, pollMillis, TimeUnit.MILLISECONDS,
                     leaseTime.toMillis(), TimeUnit.MILLISECONDS)) {
                 if (Thread.interrupted()) {
                     throw new InterruptedException();
                 }
+                pollMillis = Math.min(pollMillis * 2, INTERRUPT_POLL_MAX_MILLIS);
             }
             recordAcquired(start);
 
@@ -173,7 +195,6 @@ final class HazelcastReservation implements Reservation {
                 log.debug("Try-locked reservation: {}", identifier);
             } else {
                 metrics.recordAcquisition(Duration.between(start, Instant.now()), "unavailable");
-                metrics.recordAcquisitionAttempt(false);
 
                 log.debug("Try-lock failed, reservation unavailable: {}", identifier);
             }
@@ -213,7 +234,6 @@ final class HazelcastReservation implements Reservation {
                 log.debug("Try-locked reservation with timeout: {}", identifier);
             } else {
                 metrics.recordAcquisition(Duration.between(start, Instant.now()), "timeout");
-                metrics.recordAcquisitionAttempt(false);
 
                 log.debug("Try-lock timed out for reservation: {}", identifier);
             }
@@ -242,39 +262,39 @@ final class HazelcastReservation implements Reservation {
                 "Current thread does not hold the reservation: " + identifier);
         }
 
+        if (hold.getCount() == 1) {
+            // Remove the debug value while we still own the lock (best-effort).
+            removeDebugValue("unlock");
+        }
+
         try {
-            if (hold.getCount() == 1) {
-                try {
-                    // Remove the debug value while we still own the lock. Zero timeout so we
-                    // never block on (or delete the value of) a holder that took over after
-                    // our lease expired.
-                    lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
-                } catch (Exception e) {
-                    // Best-effort: a failed debug cleanup must not prevent the unlock below
-                    log.debug("Failed to remove debug value during unlock for {}: {}",
-                        identifier, e.getMessage());
-                }
-            }
-
             lockMap.unlock(identifier);
-
-            hold.setCount(hold.getCount() - 1);
-            if (hold.getCount() == 0) {
-                metrics.recordHeldTime(Duration.between(hold.getAcquiredAt(), Instant.now()));
-                holdTracker.remove(identifier);
-            }
-
-            log.debug("Unlocked reservation: {}", identifier);
-
         } catch (IllegalMonitorStateException e) {
-            // We tracked a hold but the cluster no longer recognizes it - the lease expired
+            // We tracked a hold but the cluster no longer recognizes it. The lease most
+            // likely expired, but the reservation may also have been force-released or
+            // ownership lost through a cluster event; the cluster cannot tell us which.
             holdTracker.remove(identifier);
             metrics.recordExpiration();
 
-            log.warn("Unlock failed for reservation {} - lease expired", identifier);
+            log.warn("Unlock failed for reservation {} - ownership was already lost "
+                + "(lease expiry or force-release)", identifier);
 
             throw new ReservationExpiredException(domain, identifier);
+        } catch (Exception e) {
+            // Infrastructure failure: the cluster-side outcome is unknown, so the local
+            // hold is kept. The caller may retry unlock(); at worst the lease expires.
+            throw new ReservationReleaseException(domain, identifier,
+                "Failed to release reservation", e);
         }
+
+        hold.decrement();
+        if (hold.getCount() == 0) {
+            Instant acquiredAt = hold.getAcquiredAt();
+            holdTracker.remove(identifier);
+            metrics.recordHeldTime(Duration.between(acquiredAt, Instant.now()));
+        }
+
+        log.debug("Unlocked reservation: {}", identifier);
     }
 
     private void recordAcquired(Instant start) {
@@ -282,28 +302,30 @@ final class HazelcastReservation implements Reservation {
 
         HoldTracker.Hold hold = holdTracker.getOrCreate(identifier);
         if (hold.getCount() > 0 && leaseLapsed(hold)) {
-            // The previous hold expired without an unlock, so this acquisition starts a
-            // fresh cluster-side hold; carrying the stale count forward would make later
-            // unlocks release more than was actually acquired.
+            // The previous hold (likely) expired without an unlock, so this acquisition
+            // starts a fresh cluster-side hold; carrying the stale count forward would
+            // make later unlocks release more than was actually acquired.
             hold.setCount(0);
         }
-        hold.setCount(hold.getCount() + 1);
+        hold.increment();
         hold.setAcquiredAt(Instant.now());
 
         metrics.recordAcquisition(Duration.between(start, Instant.now()), "acquired");
-        metrics.recordAcquisitionAttempt(true);
     }
 
     private boolean leaseLapsed(HoldTracker.Hold hold) {
-        return Duration.between(hold.getAcquiredAt(), Instant.now()).compareTo(leaseTime) >= 0;
+        Duration elapsed = Duration.between(hold.getAcquiredAt(), Instant.now());
+        return elapsed.compareTo(leaseTime.minus(staleHoldMargin)) >= 0;
     }
 
     private void recordError(Instant start) {
         metrics.recordAcquisition(Duration.between(start, Instant.now()), "error");
-        metrics.recordAcquisitionAttempt(false);
     }
 
     private void storeDebugValue() {
+        if (!debugValues) {
+            return;
+        }
         // Best-effort: the lock is already held at this point, so a failed debug write
         // must not make the acquisition look failed - the caller would never unlock,
         // leaking the lock until lease expiry. Also refreshes the entry TTL on
@@ -312,6 +334,21 @@ final class HazelcastReservation implements Reservation {
             lockMap.set(identifier, buildDebugValue(), leaseTime.toMillis(), TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             log.debug("Failed to store debug value for {}: {}", identifier, e.getMessage());
+        }
+    }
+
+    private void removeDebugValue(String operation) {
+        if (!debugValues) {
+            return;
+        }
+        try {
+            // Best-effort cleanup with zero timeout so we never block on (or delete the
+            // value of) a holder that took over after our lease expired or after a
+            // force unlock.
+            lockMap.tryRemove(identifier, 0, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.debug("Failed to remove debug value during {} for {}: {}",
+                operation, identifier, e.getMessage());
         }
     }
 
@@ -336,6 +373,10 @@ final class HazelcastReservation implements Reservation {
         Instant now = Instant.now();
 
         return String.format("holder=%s@%s,acquired=%s", threadName, HOST_NAME, now);
+    }
+
+    private static Duration min(Duration a, Duration b) {
+        return a.compareTo(b) <= 0 ? a : b;
     }
 
     private static String resolveHostName() {

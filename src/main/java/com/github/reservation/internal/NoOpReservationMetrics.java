@@ -15,10 +15,6 @@ final class NoOpReservationMetrics implements ReservationMetrics {
     }
 
     @Override
-    public void recordAcquisitionAttempt(boolean success) {
-    }
-
-    @Override
     public void recordHeldTime(Duration elapsed) {
     }
 

@@ -22,6 +22,7 @@ public final class HazelcastReservationManager implements ReservationManager {
     private final String domain;
     private final Duration leaseTime;
     private final String mapName;
+    private final boolean debugValues;
     private final ReservationMetrics metrics;
     private final HoldTracker holdTracker = new HoldTracker();
 
@@ -30,11 +31,13 @@ public final class HazelcastReservationManager implements ReservationManager {
             String domain,
             Duration leaseTime,
             String mapName,
+            boolean debugValues,
             MeterRegistry meterRegistry) {
         this.domain = domain;
         this.lockMap = hazelcastInstance.getMap(mapName);
         this.leaseTime = leaseTime;
         this.mapName = mapName;
+        this.debugValues = debugValues;
         this.metrics = ReservationMetrics.create(meterRegistry, "hazelcast", domain);
     }
 
@@ -48,6 +51,7 @@ public final class HazelcastReservationManager implements ReservationManager {
             domain,
             identifier,
             leaseTime,
+            debugValues,
             metrics,
             holdTracker
         );

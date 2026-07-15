@@ -4,6 +4,7 @@ import com.github.reservation.AbstractReservationManagerTest;
 import com.github.reservation.Reservation;
 import com.github.reservation.ReservationAcquisitionException;
 import com.github.reservation.ReservationManager;
+import com.github.reservation.ReservationReleaseException;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -180,6 +181,57 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
     }
 
     @Test
+    void unlockShouldThrowReservationReleaseExceptionOnBackendError() {
+        // Dedicated instance so shutting it down doesn't affect the shared member
+        Config config = new Config();
+        config.setClusterName("release-error-" + UUID.randomUUID());
+        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
+        HazelcastInstance doomed = Hazelcast.newHazelcastInstance(config);
+
+        ReservationManager doomedManager = ReservationManager.hazelcast(doomed)
+            .domain("doomed-release")
+            .build();
+        Reservation reservation = doomedManager.getReservation("held-then-down");
+        reservation.lock();
+
+        doomed.shutdown();
+
+        try {
+            assertThatThrownBy(reservation::unlock)
+                .isInstanceOf(ReservationReleaseException.class);
+        } finally {
+            doomedManager.close();
+        }
+    }
+
+    @Test
+    void shouldNotStoreDebugValueWhenDisabled() {
+        String mapPrefix = "no-debug-" + UUID.randomUUID().toString().substring(0, 8);
+        String mapName = mapPrefix + "-no-debug-domain";
+        mapNamesToCleanup.add(mapName);
+
+        ReservationManager plainManager = ReservationManager.hazelcast(hazelcast)
+            .domain("no-debug-domain")
+            .leaseTime(Duration.ofSeconds(5))
+            .mapPrefix(mapPrefix)
+            .debugValues(false)
+            .build();
+
+        try {
+            Reservation reservation = plainManager.getReservation("silent");
+            reservation.lock();
+            try {
+                assertThat(hazelcast.getMap(mapName).get("silent")).isNull();
+            } finally {
+                reservation.unlock();
+            }
+        } finally {
+            plainManager.close();
+        }
+    }
+
+    @Test
     void shouldRecordMetricsWhenRegistryConfigured() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         String mapPrefix = "metrics-test-" + UUID.randomUUID().toString().substring(0, 8);
@@ -202,9 +254,6 @@ class HazelcastReservationManagerTest extends AbstractReservationManagerTest {
                 .tag("backend", "hazelcast")
                 .tag("result", "acquired")
                 .timer().count()).isEqualTo(1);
-            assertThat(registry.get("reservation.acquire.attempts")
-                .tag("result", "success")
-                .counter().count()).isEqualTo(1.0);
             assertThat(registry.get("reservation.held.time")
                 .tag("domain", "metrics-domain")
                 .timer().count()).isEqualTo(1);
