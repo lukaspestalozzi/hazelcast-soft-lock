@@ -41,6 +41,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: build
+    # The Testcontainers stress suite is expensive; run it where it gates a merge
+    # (pull requests) or protects the default branch — not on every feature-branch
+    # push, which would also double-run it alongside the PR event.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
 
     name: Integration Tests
 
@@ -69,6 +73,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [ build, integration-tests ]
+    # Package whenever unit tests pass; tolerate the integration job being skipped
+    # on feature-branch pushes (see the condition above), but never its failure.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped') }}
 
     name: Package
 
