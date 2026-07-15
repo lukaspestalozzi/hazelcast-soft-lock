@@ -30,7 +30,7 @@ class HazelcastStressIntegrationTest extends AbstractStressIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(HazelcastStressIntegrationTest.class);
 
     @Container
-    static GenericContainer<?> hazelcast = new GenericContainer<>(DockerImageName.parse("hazelcast/hazelcast:5.3"))
+    static GenericContainer<?> hazelcast = new GenericContainer<>(DockerImageName.parse("hazelcast/hazelcast:5.4"))
             .withExposedPorts(5701);
 
     private HazelcastInstance client;
