@@ -70,10 +70,11 @@ public interface ReservationManager extends Closeable {
     Duration getLeaseTime();
 
     /**
-     * Closes this manager and releases associated resources.
+     * Closes this manager and releases any resources it owns.
      *
-     * <p>Note: This does NOT close the underlying Hazelcast instance,
-     * nor does it release any currently held reservations.</p>
+     * <p>Note: This never closes backend resources that were injected into the
+     * manager (e.g. a Hazelcast instance passed to the builder), nor does it
+     * release any currently held reservations.</p>
      */
     @Override
     void close();

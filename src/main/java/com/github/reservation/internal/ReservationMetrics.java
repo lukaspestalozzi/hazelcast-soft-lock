@@ -12,12 +12,15 @@ import java.time.Duration;
  *
  * <p>Instances are scoped to one manager, so backend and domain are fixed
  * at creation time.</p>
+ *
+ * <p>Instances returned by {@link #create} never throw: metrics run after
+ * lock state has already changed, and a throwing registry must not make a
+ * successful acquisition look failed (which would leak the lock until lease
+ * expiry) or corrupt hold bookkeeping.</p>
  */
 public interface ReservationMetrics {
 
     void recordAcquisition(Duration elapsed, String result);
-
-    void recordAcquisitionAttempt(boolean success);
 
     void recordHeldTime(Duration elapsed);
 
@@ -29,12 +32,13 @@ public interface ReservationMetrics {
      * @param meterRegistry the registry to record to, or null for no-op
      * @param backend backend identifier tag (e.g. "hazelcast")
      * @param domain the manager's domain tag
-     * @return a metrics instance, never null
+     * @return a metrics instance that never throws, never null
      */
     static ReservationMetrics create(MeterRegistry meterRegistry, String backend, String domain) {
         if (meterRegistry == null) {
             return NoOpReservationMetrics.INSTANCE;
         }
-        return new MicrometerReservationMetrics(meterRegistry, backend, domain);
+        return new GuardedReservationMetrics(
+            new MicrometerReservationMetrics(meterRegistry, backend, domain));
     }
 }

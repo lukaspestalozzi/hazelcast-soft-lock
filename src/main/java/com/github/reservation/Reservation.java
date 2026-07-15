@@ -28,19 +28,41 @@ public interface Reservation extends Lock {
     String getIdentifier();
 
     /**
-     * Returns the remaining lease time for this reservation.
+     * Returns the remaining lease time for the <b>current thread's</b> hold on this
+     * reservation.
      *
-     * @return remaining lease time, or {@link Duration#ZERO} if not held
-     *         or lease has expired
+     * <p>This is a local estimate derived from the time of the current thread's most
+     * recent acquisition and the configured lease time; it does not consult the
+     * backend. It can therefore disagree with cluster reality after clock drift or
+     * after the reservation was force-released elsewhere.</p>
+     *
+     * @return remaining lease time, or {@link Duration#ZERO} if the current thread
+     *         does not hold the reservation or its lease has expired
      */
     Duration getRemainingLeaseTime();
 
     /**
-     * Checks if this reservation is currently held by any thread/process.
+     * Checks if this reservation is currently held by <b>any</b> thread or process.
+     *
+     * <p>To ask whether the calling thread itself holds the reservation, use
+     * {@link #isHeldByCurrentThread()}.</p>
      *
      * @return true if the reservation is held, false otherwise
      */
     boolean isLocked();
+
+    /**
+     * Checks if the current thread holds this reservation.
+     *
+     * <p>This reflects the local hold bookkeeping, not a backend query: it returns
+     * {@code false} once the lease is (locally judged to be) expired, slightly before
+     * the configured lease time fully elapses — implementations apply a safety margin
+     * so that clock skew errs toward reporting "not held" rather than falsely
+     * reporting a hold that the cluster already released.</p>
+     *
+     * @return true if the current thread holds an unexpired lease on this reservation
+     */
+    boolean isHeldByCurrentThread();
 
     /**
      * Forces the release of this reservation regardless of ownership.
@@ -48,6 +70,11 @@ public interface Reservation extends Lock {
      * <p><b>Warning:</b> This is an administrative operation that should only
      * be used for recovery scenarios. It will release the reservation even if held
      * by another thread or process.</p>
+     *
+     * <p>Only the calling thread's local hold state can be cleared. If another thread
+     * (or process) held the reservation, its local state goes stale: its
+     * {@link #getRemainingLeaseTime()} keeps counting down and its eventual
+     * {@link #unlock()} throws {@link ReservationExpiredException}.</p>
      */
     void forceUnlock();
 
@@ -97,7 +124,11 @@ public interface Reservation extends Lock {
     /**
      * Releases the reservation.
      *
-     * @throws ReservationExpiredException if the lease time has expired before unlock
+     * @throws ReservationExpiredException if ownership was already lost when unlocking —
+     *         most commonly because the lease expired, but also after an administrative
+     *         {@link #forceUnlock()} by another thread or process
+     * @throws ReservationReleaseException if an infrastructure failure prevents the
+     *         release; the local hold is kept and the call may be retried
      * @throws IllegalMonitorStateException if the current thread does not hold the reservation
      */
     @Override

@@ -42,13 +42,23 @@ public abstract class AbstractReservationManagerBuilder<T extends AbstractReserv
      *
      * @param leaseTime the lease time duration (must be positive)
      * @return this builder
-     * @throws IllegalArgumentException if leaseTime is null, zero, or negative
+     * @throws NullPointerException if leaseTime is null
+     * @throws IllegalArgumentException if leaseTime is zero, negative, or too large
+     *         to be expressed in milliseconds
      */
     @SuppressWarnings("unchecked")
     public T leaseTime(Duration leaseTime) {
         Objects.requireNonNull(leaseTime, "leaseTime must not be null");
         if (leaseTime.isZero() || leaseTime.isNegative()) {
             throw new IllegalArgumentException("leaseTime must be positive");
+        }
+        try {
+            // Backends pass the lease to their APIs in milliseconds; fail fast here
+            // instead of surfacing an ArithmeticException at lock time.
+            leaseTime.toMillis();
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException(
+                "leaseTime is too large to be expressed in milliseconds", e);
         }
         this.leaseTime = leaseTime;
         return (T) this;

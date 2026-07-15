@@ -330,6 +330,29 @@ public abstract class AbstractReservationManagerTest {
         assertThat(result.get()).isTrue();
     }
 
+    // ==================== isHeldByCurrentThread Tests ====================
+
+    @Test
+    @Timeout(10)
+    void isHeldByCurrentThreadShouldTrackOnlyTheHoldingThread() throws Exception {
+        Reservation reservation = manager.getReservation("held-by-me");
+        assertThat(reservation.isHeldByCurrentThread()).isFalse();
+
+        reservation.lock();
+        try {
+            assertThat(reservation.isHeldByCurrentThread()).isTrue();
+
+            // Another thread sees the lock as held, but not by itself
+            CompletableFuture<Boolean> otherThread = CompletableFuture.supplyAsync(() ->
+                manager.getReservation("held-by-me").isHeldByCurrentThread());
+            assertThat(otherThread.get(2, TimeUnit.SECONDS)).isFalse();
+        } finally {
+            reservation.unlock();
+        }
+
+        assertThat(reservation.isHeldByCurrentThread()).isFalse();
+    }
+
     // ==================== forceUnlock Tests ====================
 
     @Test
@@ -346,6 +369,51 @@ public abstract class AbstractReservationManagerTest {
         // Original holder's unlock should fail
         assertThatThrownBy(reservation::unlock)
             .isInstanceOf(Exception.class); // Could be ReservationExpiredException or IllegalMonitorStateException
+    }
+
+    @Test
+    @Timeout(15)
+    void forceUnlockFromAnotherThreadShouldReleaseAndFailHoldersUnlock() throws Exception {
+        // The realistic admin scenario: the force-unlocking thread is NOT the holder.
+        // The holder's local state goes stale and its unlock must fail loudly.
+        Reservation holderReservation = manager.getReservation("force-cross-thread");
+        CountDownLatch lockedByHolder = new CountDownLatch(1);
+        CountDownLatch releaseHolder = new CountDownLatch(1);
+        AtomicReference<Throwable> holderUnlockError = new AtomicReference<>();
+
+        Thread holder = new Thread(() -> {
+            holderReservation.lock();
+            lockedByHolder.countDown();
+            try {
+                releaseHolder.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            try {
+                holderReservation.unlock();
+            } catch (Throwable t) {
+                holderUnlockError.set(t);
+            }
+        });
+        holder.start();
+        assertThat(lockedByHolder.await(5, TimeUnit.SECONDS)).isTrue();
+
+        // Force-unlock from this (non-holding) thread
+        manager.getReservation("force-cross-thread").forceUnlock();
+        assertThat(holderReservation.isLocked()).isFalse();
+
+        // The reservation must be acquirable again
+        Reservation mine = manager.getReservation("force-cross-thread");
+        assertThat(mine.tryLock()).isTrue();
+        mine.unlock();
+
+        // The original holder's unlock must surface the lost ownership
+        releaseHolder.countDown();
+        holder.join(5000);
+        assertThat(holder.isAlive()).isFalse();
+        assertThat(holderUnlockError.get())
+            .as("holder's unlock after a foreign forceUnlock must fail loudly")
+            .isInstanceOf(ReservationExpiredException.class);
     }
 
     // ==================== Reentrancy Tests ====================
@@ -464,6 +532,55 @@ public abstract class AbstractReservationManagerTest {
         }
     }
 
+    @Test
+    @Timeout(20)
+    void lockShouldKeepWaitingThroughRepeatedInterrupts() throws Exception {
+        // Lock.lock() must not give up when the waiting thread is interrupted. This
+        // exercises the retry loop that clears the interrupt flag between attempts
+        // (a regression there makes the loop spin or the waiter fail spuriously,
+        // especially on the client topology where interrupts surface as wrapped
+        // HazelcastExceptions).
+        Reservation holder = manager.getReservation("interrupt-storm");
+        holder.lock();
+
+        AtomicBoolean acquired = new AtomicBoolean(false);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        CountDownLatch waiterStarted = new CountDownLatch(1);
+
+        Thread waiter = new Thread(() -> {
+            Reservation waiterRes = manager.getReservation("interrupt-storm");
+            waiterStarted.countDown();
+            try {
+                waiterRes.lock(); // must survive the interrupts below
+                acquired.set(true);
+                // Clear the (re-asserted) interrupt flag so the unlock call is not
+                // disturbed by it on the client topology
+                Thread.interrupted();
+                waiterRes.unlock();
+            } catch (Throwable t) {
+                error.set(t);
+            }
+        });
+        waiter.start();
+        assertThat(waiterStarted.await(5, TimeUnit.SECONDS)).isTrue();
+        Thread.sleep(300); // let the waiter block inside lock()
+
+        for (int i = 0; i < 3; i++) {
+            waiter.interrupt();
+            Thread.sleep(150);
+        }
+        assertThat(acquired.get()).as("waiter must still be waiting").isFalse();
+
+        holder.unlock();
+        waiter.join(10_000);
+
+        assertThat(waiter.isAlive()).as("waiter must terminate").isFalse();
+        assertThat(error.get()).as("lock() must not throw on interrupts").isNull();
+        assertThat(acquired.get())
+            .as("waiter must acquire despite repeated interrupts")
+            .isTrue();
+    }
+
     // ==================== Isolation Tests ====================
 
     @Test
@@ -478,6 +595,48 @@ public abstract class AbstractReservationManagerTest {
         lock2.unlock();
 
         lock1.unlock();
+    }
+
+    // ==================== Lease Bookkeeping Safety ====================
+
+    @Test
+    @Timeout(30)
+    void reacquireNearLeaseEndMustNeverSilentlyReleaseTheLock() throws Exception {
+        // Guards the failure mode of expiry bookkeeping: when local lease accounting
+        // is uncertain (re-acquisition close to lease end, where local clock and
+        // cluster lease can disagree), a single unlock must NOT leave the lock
+        // silently released while the caller still believes it holds one more hold.
+        // The acceptable failure mode is the opposite: a leaked hold that lease
+        // expiry cleans up.
+        ReservationManager shortLeaseManager = createManager(DEFAULT_DOMAIN, Duration.ofSeconds(4));
+        try {
+            Reservation reservation = shortLeaseManager.getReservation("near-lease-end");
+
+            reservation.lock();
+            // Sleep into the uncertainty window: close to lease end locally, but
+            // before the cluster-side lease actually expires.
+            Thread.sleep(3600);
+
+            reservation.lock();   // re-acquire while the cluster still holds the lease
+            reservation.unlock(); // one unlock...
+
+            // ...must never leave the lock released: either one hold is still
+            // correctly tracked, or (with conservative bookkeeping) a reentrant
+            // hold was leaked — both keep the lock held.
+            assertThat(reservation.isLocked())
+                .as("single unlock after an uncertain re-acquisition must not release the lock")
+                .isTrue();
+
+            // Clean up whatever hold remains (implementation-dependent)
+            try {
+                reservation.unlock();
+            } catch (Exception ignored) {
+                // a conservatively reset hold count makes this throw - acceptable
+            }
+            reservation.forceUnlock();
+        } finally {
+            shortLeaseManager.close();
+        }
     }
 
     // ==================== Unlock Without Lock Tests ====================
