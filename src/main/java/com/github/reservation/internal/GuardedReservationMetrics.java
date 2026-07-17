@@ -28,7 +28,7 @@ final class GuardedReservationMetrics implements ReservationMetrics {
         try {
             delegate.recordAcquisition(elapsed, result);
         } catch (Exception e) {
-            log.debug("Failed to record acquisition metric: {}", e.getMessage());
+            log.debug("Failed to record acquisition metric", e);
         }
     }
 
@@ -37,7 +37,7 @@ final class GuardedReservationMetrics implements ReservationMetrics {
         try {
             delegate.recordHeldTime(elapsed);
         } catch (Exception e) {
-            log.debug("Failed to record held-time metric: {}", e.getMessage());
+            log.debug("Failed to record held-time metric", e);
         }
     }
 
@@ -46,7 +46,7 @@ final class GuardedReservationMetrics implements ReservationMetrics {
         try {
             delegate.recordExpiration();
         } catch (Exception e) {
-            log.debug("Failed to record expiration metric: {}", e.getMessage());
+            log.debug("Failed to record expiration metric", e);
         }
     }
 }
