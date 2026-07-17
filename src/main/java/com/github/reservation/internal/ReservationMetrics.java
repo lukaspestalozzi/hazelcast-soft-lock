@@ -13,10 +13,14 @@ import java.time.Duration;
  * <p>Instances are scoped to one manager, so backend and domain are fixed
  * at creation time.</p>
  *
- * <p>Instances returned by {@link #create} never throw: metrics run after
- * lock state has already changed, and a throwing registry must not make a
- * successful acquisition look failed (which would leak the lock until lease
- * expiry) or corrupt hold bookkeeping.</p>
+ * <p>The recording methods of instances returned by {@link #create} never
+ * throw: they run after lock state has already changed, and a throwing
+ * registry must not make a successful acquisition look failed (which would
+ * leak the lock until lease expiry) or corrupt hold bookkeeping.
+ * {@link #create} itself registers meters eagerly and MAY throw on a broken
+ * registry — deliberately: it runs at manager build time, before any lock
+ * state exists, where a configuration error should fail fast rather than
+ * silently degrade metrics to a no-op.</p>
  */
 public interface ReservationMetrics {
 
@@ -29,10 +33,14 @@ public interface ReservationMetrics {
     /**
      * Creates a ReservationMetrics instance for one manager.
      *
+     * <p>May throw if the registry rejects meter registration (see class javadoc):
+     * this runs at manager build time, where failing fast on a misconfigured
+     * registry is preferable to silently dropping metrics.</p>
+     *
      * @param meterRegistry the registry to record to, or null for no-op
      * @param backend backend identifier tag (e.g. "hazelcast")
      * @param domain the manager's domain tag
-     * @return a metrics instance that never throws, never null
+     * @return a metrics instance whose recording methods never throw, never null
      */
     static ReservationMetrics create(MeterRegistry meterRegistry, String backend, String domain) {
         if (meterRegistry == null) {
